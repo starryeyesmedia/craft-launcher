@@ -577,7 +577,7 @@ fn same_cache_as_helper(paths: &Paths, exe: &Path) -> Result<(), String> {
 /// `reference`, this program. Refuses an unsigned file, another publisher's, and every file when
 /// `reference` itself isn't signed.
 #[cfg(windows)]
-pub(crate) fn signed_like(reference: &Path, file: &Path) -> Result<(), String> {
+fn signed_like(reference: &Path, file: &Path) -> Result<(), String> {
     let publisher = |path: &Path| verifysign::verify_file(path).map(|signature| signature.subject_name());
     let ours = publisher(reference).map_err(|e| format!("this copy of ArtCraft Launcher isn't signed ({e}), so it doesn't install updates"))?;
     let theirs = publisher(file).map_err(|e| format!("{} isn't signed ({e})", file.display()))?;

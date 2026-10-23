@@ -1,96 +1,54 @@
-//! The one-elevation helper for a verified batch of Windows Installer packages.
-//!
-//! The launcher starts itself with `RunAs` once per MSI batch. The elevated copy accepts only
-//! absolute paths in the launcher's download directory, checks every file against the published
-//! SHA-256 and the launcher's Authenticode publisher, holds each file open with write/rename/delete
-//! sharing denied, and invokes the machine's `msiexec.exe` from its system directory. Other
-//! platforms reject the helper flag.
+//! MSI batch elevation uses only the OS PowerShell host and Windows Installer. The GUI
+//! executable is NEVER elevated. See docs/windows-msi-security.md for the trust boundary.
 
-use std::ffi::OsString;
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
 
-#[cfg(windows)]
-use sha2::{Digest, Sha256};
+use artcraft_launcher_core::{CraftApp, PackageKind, release, version};
+use serde::Serialize;
 
+#[cfg(any(windows, test))]
 use crate::msi_batch::Item;
-#[cfg(windows)]
-use crate::msi_batch::Report;
-#[cfg(windows)]
-use crate::paths::Paths;
 
 pub const FLAG: &str = "--install-msis";
-const MAX_ITEMS: usize = 64;
-#[cfg(windows)]
-const DECLINED: i32 = 1223;
-const CHANGED: &str = "changed";
-const UNREADABLE: &str = "unreadable";
-const UNSIGNED: &str = "unsigned";
-const REJECTED: &str = "rejected";
-const INTERRUPTED: &str = "interrupted";
 
-pub fn helper_args(results: &Path, downloads: &Path, items: &[Item]) -> Vec<OsString> {
-    let mut args = vec![results.as_os_str().to_os_string(), downloads.as_os_str().to_os_string()];
-    for item in items {
-        args.push(item.msi.as_os_str().to_os_string());
-        args.push(item.sha256.clone().into());
-        args.push(item.destination.as_deref().map_or_else(OsString::new, |path| path.as_os_str().to_os_string()));
-    }
-    args
+/// Reject the obsolete signed "install any MSI" entry point, including in development builds.
+pub fn helper_main(_: &[std::ffi::OsString]) -> u8 {
+    2
 }
 
-/// Parses the helper's fixed argument shape. Hashes are lowercase because the release parser
-/// normalizes published SHA-256 values before they reach this point.
-pub fn parse_args(args: &[OsString]) -> Option<(PathBuf, PathBuf, Vec<Item>)> {
-    let (results, rest) = args.split_first()?;
-    let (downloads, rest) = rest.split_first()?;
-    let results = PathBuf::from(results);
-    let downloads = PathBuf::from(downloads);
-    let (triples, odd) = rest.as_chunks::<3>();
-    if !results.is_absolute() || !downloads.is_absolute() || triples.is_empty() || !odd.is_empty() || triples.len() > MAX_ITEMS {
-        return None;
-    }
-    let items = triples
-        .iter()
-        .map(|[msi, sha, destination]| {
-            let msi = PathBuf::from(msi);
-            let sha = sha.to_str()?;
-            let destination = if destination.is_empty() { None } else { Some(PathBuf::from(destination)) };
-            let valid_sha = sha.len() == 64 && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-            (msi.is_absolute()
-                && msi.extension().is_some_and(|e| e.eq_ignore_ascii_case("msi"))
-                && destination.as_ref().is_none_or(|d| d.is_absolute())
-                && valid_sha)
-                .then_some(Item { msi, sha256: sha.to_string(), destination })
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Some((results, downloads, items))
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReleaseIdentity {
+    pub app: String,
+    pub tag: String,
+    pub asset: String,
 }
 
-pub fn parse_results(text: &str, count: usize) -> Vec<(usize, Result<(), String>)> {
-    let mut seen = vec![false; count];
-    text.split_inclusive('\n')
-        .filter_map(|line| {
-            let (index, result) = line.strip_suffix('\n')?.trim().split_once(' ')?;
-            let index: usize = index.parse().ok()?;
-            let seen = seen.get_mut(index).filter(|seen| !**seen)?;
-            let outcome = match result {
-                CHANGED => Err("the download changed after it was checked, so it wasn't installed. Try again".into()),
-                UNREADABLE => Err("the download couldn't be read to install it. Try again".into()),
-                UNSIGNED => Err("the download isn't signed by ArtCraft Launcher's publisher".into()),
-                REJECTED => Err("the download isn't in ArtCraft Launcher's download folder".into()),
-                INTERRUPTED => msi_outcome(None),
-                code => msi_outcome(Some(code.parse().ok()?)),
-            };
-            *seen = true;
-            Some((index, outcome))
-        })
-        .collect()
+/// Derive the release identity from the catalog and official URL, never from a caller's hash.
+pub fn release_identity(app: &CraftApp, asset: &release::Asset) -> Result<ReleaseIdentity, String> {
+    let prefix = release::download_prefix(app.repo);
+    if !release::download_url_under(&asset.url, &prefix) {
+        return Err("the MSI must come from the app's official GitHub release".into());
+    }
+    let rest = asset.url.strip_prefix(&prefix).ok_or("invalid release URL")?;
+    let (tag, name) = rest.split_once('/').ok_or("invalid release URL")?;
+    let stems: Vec<_> = app.stems().collect();
+    let parsed = artcraft_launcher_core::platform::parse_asset_name(name, &stems).ok_or("invalid MSI release name")?;
+    if name != asset.name
+        || !tag.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-+".contains(&b))
+        || version::parse(tag) != version::parse(&parsed.version)
+        || parsed.kind != PackageKind::Msi
+        || !matches!(parsed.token.as_str(), "windows-x64" | "windows-x86" | "windows-arm64")
+    {
+        return Err("the MSI does not match the official Windows release".into());
+    }
+    Ok(ReleaseIdentity { app: app.id.into(), tag: tag.into(), asset: name.into() })
 }
 
 pub fn msi_outcome(code: Option<i32>) -> Result<(), String> {
     match code {
         Some(0 | 3010 | 1641) => Ok(()),
-        Some(1602) => Err("cancelled".into()),
+        Some(1602 | 1223) => Err("cancelled".into()),
         Some(1618) => Err("another installation is in progress. Wait for it to finish, then try again.".into()),
         Some(1925 | 1303) => Err("Windows didn't allow the install (administrator permission is needed)".into()),
         Some(c) => Err(format!("the Windows Installer stopped with error {c}")),
@@ -98,305 +56,588 @@ pub fn msi_outcome(code: Option<i32>) -> Result<(), String> {
     }
 }
 
-/// Entry point used by the launcher binary when its first argument is [`FLAG`].
-pub fn helper_main(args: &[OsString]) -> u8 {
-    let Some((results, downloads, items)) = parse_args(args) else { return 2 };
-    #[cfg(windows)]
-    {
-        let Ok(me) = std::env::current_exe() else { return 2 };
-        if crate::self_update::signed_like(&me, &me).is_err() {
-            return 2;
-        }
-        return run_batch(&results, &downloads, &items, &me);
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (results, downloads, items);
-        2
+fn result_outcome(value: &str) -> Result<(), String> {
+    match value {
+        "rejected" => Err("Windows refused an MSI that failed official release, signature, identity, scope, or file integrity checks".into()),
+        "running" => Err("the app is running. Quit it, then try again.".into()),
+        value => msi_outcome(value.parse().ok()),
     }
 }
 
-/// Starts the signed launcher once with administrator rights and reports every item as it is
-/// installed. The helper itself performs the security checks after elevation.
+/// Ignore torn lines and duplicate/out-of-range indices. The transport is in an
+/// administrator-owned directory; parsing alone is not an authentication mechanism.
+pub fn parse_results(text: &str, count: usize) -> Vec<(usize, Result<(), String>)> {
+    let mut seen = vec![false; count];
+    text.split_inclusive('\n')
+        .filter_map(|line| {
+            let (index, value) = line.strip_suffix('\n')?.trim().split_once(' ')?;
+            let index = index.parse::<usize>().ok()?;
+            let seen = seen.get_mut(index).filter(|seen| !**seen)?;
+            *seen = true;
+            Some((index, result_outcome(value)))
+        })
+        .collect()
+}
+
+/// The script is fixed program code embedded in Rust, not a downloaded/file-based script.
+/// All request data is base64 JSON. Only Windows system executables execute with elevation.
+#[cfg(any(windows, test))]
+pub const POLICY: &str = r#"
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 2
+$system = [Environment]::SystemDirectory
+[Environment]::CurrentDirectory = $system
+Set-Location -LiteralPath $system
+$env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules')
+Import-Module ([IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'))
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+function Assert-LocalPath([string]$path) {
+    # No UNC/device paths, alternate streams, quotes, control characters or relative paths.
+    if ($path -notmatch '^[A-Za-z]:\\' -or $path.Substring(2) -match '[:"\x00-\x1f]' -or $path.Length -gt 240) {
+        throw 'Invalid local path'
+    }
+    $full = [IO.Path]::GetFullPath($path)
+    $cursor = $full
+    while ($cursor) {
+        if ([IO.File]::Exists($cursor) -or [IO.Directory]::Exists($cursor)) {
+            if (([IO.File]::GetAttributes($cursor) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'Reparse points are not allowed'
+            }
+        }
+        $cursor = [IO.Path]::GetDirectoryName($cursor)
+    }
+    return $full
+}
+
+function Assert-InstallDestination([string]$path) {
+    $full = Assert-LocalPath $path
+    $cursor = $full
+    $nearest = $true
+    $trusted = @('S-1-5-18', 'S-1-5-32-544',
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    while ($cursor) {
+        if ([IO.Directory]::Exists($cursor)) {
+            $acl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $cursor
+            if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $trusted) {
+                throw 'Install destination has an untrusted owner'
+            }
+            foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+                if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+                if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin $trusted) {
+                    # Ancestors must not permit deletion/replacement or ACL/owner changes.
+                    # The closest existing directory must also forbid creating/replacing files.
+                    $mask = 0x000d0040
+                    if ($nearest) { $mask = 0x000d0156 }
+                    if (([int]$rule.FileSystemRights -band $mask) -ne 0) { throw 'Install destination is user-writable' }
+                }
+            }
+            $nearest = $false
+        } elseif ([IO.File]::Exists($cursor)) { throw 'Install destination is a file' }
+        $cursor = [IO.Path]::GetDirectoryName($cursor)
+    }
+    return $full
+}
+
+function New-ProtectedRun([string]$session) {
+    if ($session -cnotmatch '^[a-f0-9]{32}$') { throw 'Invalid session' }
+    # SystemDirectory is an OS API result, not SystemRoot/PATH/LOCALAPPDATA from the caller.
+    $root = [IO.Path]::Combine([Environment]::SystemDirectory, "ArtCraft-MSI-$session")
+    $null = Assert-LocalPath $root
+    if ([IO.Directory]::Exists($root) -or [IO.File]::Exists($root)) { throw 'Session already exists' }
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    # SYSTEM/Administrators own all writes. Users have read/execute only for progress/results.
+    $acl.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)')
+    $null = [IO.Directory]::CreateDirectory($root, $acl)
+    return $root
+}
+
+function Read-OfficialChecksums([string]$url) {
+    for ($redirect = 0; $redirect -lt 6; $redirect++) {
+        $uri = [Uri]$url
+        if ($uri.Scheme -cne 'https' -or -not $uri.IsDefaultPort -or $uri.UserInfo -ne '' -or
+            $uri.Host -notin @('github.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com')) {
+            throw 'Untrusted checksum redirect'
+        }
+        $req = [Net.HttpWebRequest]::Create($uri)
+        $req.AllowAutoRedirect = $false
+        $req.Timeout = 20000
+        $req.ReadWriteTimeout = 20000
+        $req.UserAgent = 'ArtCraft-Launcher/MSI'
+        $response = $req.GetResponse()
+        try {
+            if ([int]$response.StatusCode -ge 300 -and [int]$response.StatusCode -lt 400) {
+                $url = [Uri]::new($uri, $response.Headers['Location']).AbsoluteUri
+                continue
+            }
+            if ([int]$response.StatusCode -ne 200) { throw 'No official checksums' }
+            $stream = $response.GetResponseStream()
+            $memory = New-Object IO.MemoryStream
+            try {
+                $buffer = New-Object byte[] 8192
+                while (($n = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    if ($memory.Length + $n -gt 4194304) { throw 'Oversized checksums' }
+                    $memory.Write($buffer, 0, $n)
+                }
+                return [Text.Encoding]::UTF8.GetString($memory.ToArray())
+            } finally { $memory.Dispose(); $stream.Dispose() }
+        } finally { $response.Dispose() }
+    }
+    throw 'Too many checksum redirects'
+}
+
+function Get-PublishedHash([string]$text, [string]$asset) {
+    $found = @()
+    foreach ($line in ($text -split "\n")) {
+        if ($line -match '^([0-9a-fA-F]{64})\s+\*?([^\r\n]+)\r?$' -and $Matches[2].TrimEnd("`r") -ceq $asset) {
+            $found += $Matches[1].ToLowerInvariant()
+        }
+    }
+    if ($found.Count -ne 1) { throw 'Missing or ambiguous published checksum' }
+    return $found[0]
+}
+
+function New-MsiApi {
+    # Call the absolute system MSI library directly. COM activation is deliberately avoided:
+    # caller-owned HKCU COM registrations must never influence an elevated DLL load.
+    # Reflection.Emit supplies managed P/Invoke declarations, without C# compilation or
+    # writing/loading an assembly in a user-owned temporary directory.
+    $assembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly(
+        [Reflection.AssemblyName]::new('ArtCraftMsi'), [Reflection.Emit.AssemblyBuilderAccess]::Run)
+    $module = $assembly.DefineDynamicModule('ArtCraftMsi')
+    $type = $module.DefineType('ArtCraftMsi', [Reflection.TypeAttributes]'Public, Abstract, Sealed')
+    $dll = [IO.Path]::Combine([Environment]::SystemDirectory, 'msi.dll')
+    $u = [uint32]
+    $ref = $u.MakeByRefType()
+    $definitions = @(
+        @('MsiOpenDatabaseW', @([string], [IntPtr], $ref)),
+        @('MsiDatabaseOpenViewW', @($u, [string], $ref)),
+        @('MsiViewExecute', @($u, $u)),
+        @('MsiViewFetch', @($u, $ref)),
+        @('MsiRecordGetStringW', @($u, $u, [Text.StringBuilder], $ref)),
+        @('MsiViewClose', @($u)),
+        @('MsiCloseHandle', @($u)))
+    foreach ($definition in $definitions) {
+        $method = $type.DefinePInvokeMethod($definition[0], $dll,
+            [Reflection.MethodAttributes]'Public, Static, PinvokeImpl',
+            [Reflection.CallingConventions]::Standard, $u, [Type[]]$definition[1],
+            [Runtime.InteropServices.CallingConvention]::Winapi,
+            [Runtime.InteropServices.CharSet]::Unicode)
+        $method.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+    }
+    return $type.CreateType()
+}
+
+function Get-MsiProperty($api, [uint32]$db, [string]$name) {
+    # name is a program literal. MSI APIs open the protected staged file READ-ONLY.
+    $arguments = [object[]]@($db, "SELECT Value FROM Property WHERE Property='$name'", [uint32]0)
+    if ($api.GetMethod('MsiDatabaseOpenViewW').Invoke($null, $arguments) -ne 0) { throw 'MSI query failed' }
+    $view = [uint32]$arguments[2]
+    try {
+        if ($api.GetMethod('MsiViewExecute').Invoke($null, [object[]]@($view, [uint32]0)) -ne 0) { throw 'MSI query failed' }
+        $arguments = [object[]]@($view, [uint32]0)
+        $status = $api.GetMethod('MsiViewFetch').Invoke($null, $arguments)
+        if ($status -eq 259) { return '' }
+        if ($status -ne 0) { throw 'MSI record failed' }
+        $record = [uint32]$arguments[1]
+        try {
+            $value = [Text.StringBuilder]::new(1024)
+            $arguments = [object[]]@($record, [uint32]1, $value, [uint32]1024)
+            if ($api.GetMethod('MsiRecordGetStringW').Invoke($null, $arguments) -ne 0) { throw 'MSI property too long or unreadable' }
+            return $value.ToString()
+        } finally { $null = $api.GetMethod('MsiCloseHandle').Invoke($null, [object[]]@($record)) }
+    } finally {
+        $null = $api.GetMethod('MsiViewClose').Invoke($null, [object[]]@($view))
+        $null = $api.GetMethod('MsiCloseHandle').Invoke($null, [object[]]@($view))
+    }
+}
+
+function Assert-MsiIdentity([string]$file, $app, [string]$version) {
+    $api = New-MsiApi
+    $arguments = [object[]]@($file, [IntPtr]::Zero, [uint32]0)
+    if ($api.GetMethod('MsiOpenDatabaseW').Invoke($null, $arguments) -ne 0) { throw 'Cannot open MSI read-only' }
+    $db = [uint32]$arguments[2]
+    try {
+        if ((Get-MsiProperty $api $db 'ALLUSERS') -cne '1' -or
+            (Get-MsiProperty $api $db 'MSIINSTALLPERUSER') -notin @('', '0') -or
+            (Get-MsiProperty $api $db 'Manufacturer') -cne 'Learning Machines LLC' -or
+            (Get-MsiProperty $api $db 'ProductName') -cnotin $app.names -or
+            (Get-MsiProperty $api $db 'ProductVersion') -cne $version) { throw 'MSI identity/scope mismatch' }
+    } finally { $null = $api.GetMethod('MsiCloseHandle').Invoke($null, [object[]]@($db)) }
+}
+
+function Assert-OfficialSignature([string]$file) {
+    $sig = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $file
+    if ($sig.Status -ne 'Valid' -or $null -eq $sig.SignerCertificate -or
+        $sig.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -cne 'Learning Machines LLC') {
+        throw 'Official Authenticode signature required'
+    }
+}
+
+function Get-ReleaseAuthorization($item, $catalog) {
+    $app = @($catalog | Where-Object { $_.id -ceq $item.release.app })
+    if ($app.Count -ne 1) { throw 'Unknown app' }
+    $app = $app[0]
+    $tag = [string]$item.release.tag
+    $asset = [string]$item.release.asset
+    if ($tag.Length -gt 64 -or $tag -cnotmatch '^v?([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$') {
+        throw 'Invalid official release tag'
+    }
+    $numeric = $Matches[1]
+    $releaseVersion = $tag -creplace '^v', ''
+    $valid = $false
+    foreach ($stem in $app.stems) {
+        foreach ($arch in @('x64', 'x86', 'arm64')) {
+            if ($asset -ceq "$stem-$releaseVersion-windows-$arch.msi") { $valid = $true }
+        }
+    }
+    if (-not $valid) { throw 'MSI does not match its app and version' }
+    # The catalog is compiled into the policy. No caller-supplied repository, URL or digest is
+    # authoritative. Fetch SHA256SUMS.txt independently after elevation over Windows TLS.
+    $url = "https://github.com/$($app.repo)/releases/download/$tag/SHA256SUMS.txt"
+    $sha = Get-PublishedHash (Read-OfficialChecksums $url) $asset
+    if ($item.sha256 -cne $sha) { throw 'Caller checksum disagrees with official publication' }
+    return @{ app = $app; sha = $sha; version = $numeric }
+}
+
+function Copy-VerifiedPackage($item, $authorization, [string]$root, [int]$index, [int]$port, [string]$session) {
+    $target = [IO.Path]::Combine($root, "$index.msi")
+    # Never open a caller-owned path as administrator: even an initially local path could
+    # race through a junction to an SMB share and leak elevated network credentials.
+    # A loopback-only byte source runs unelevated. Its bytes remain entirely untrusted.
+    $req=[Net.HttpWebRequest]::Create("http://127.0.0.1:$port/$session/$index")
+    $req.Proxy=$null
+    $req.Credentials=$null
+    $req.UserAgent='ArtCraft-Launcher/MSI'
+    $req.AllowAutoRedirect=$false
+    $req.Timeout=20000
+    $req.ReadWriteTimeout=20000
+    $response=$req.GetResponse()
+    try {
+        if ([int]$response.StatusCode -ne 200 -or $response.ContentLength -lt 0 -or $response.ContentLength -gt 17179869184) {
+            throw 'Invalid package stream'
+        }
+        $inputFile=$response.GetResponseStream()
+        $output = [IO.File]::Open($target, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $remaining=$response.ContentLength
+            $buffer=New-Object byte[] 65536
+            while ($remaining -gt 0) {
+                $n=$inputFile.Read($buffer,0,[int][Math]::Min($remaining,$buffer.Length))
+                if ($n -eq 0) { throw 'Truncated package stream' }
+                $output.Write($buffer,0,$n)
+                $remaining-=$n
+            }
+        } finally { $output.Dispose(); $inputFile.Dispose() }
+    } finally { $response.Dispose() }
+    $locked = [IO.File]::Open($target, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $hash = [Security.Cryptography.SHA256]::Create()
+        try { $actual = ([BitConverter]::ToString($hash.ComputeHash($locked))).Replace('-', '').ToLowerInvariant() }
+        finally { $hash.Dispose() }
+        if ($actual -cne $authorization.sha) { throw 'Changed package' }
+        Assert-OfficialSignature $target
+        Assert-MsiIdentity $target $authorization.app $authorization.version
+    } finally { $locked.Dispose() }
+    return $target
+}
+
+function Test-AppRunning($app) {
+    foreach ($process in [Diagnostics.Process]::GetProcesses()) {
+        try {
+            if ($process.ProcessName -in $app.stems) { return $true }
+        } finally { $process.Dispose() }
+    }
+    return $false
+}
+
+function Invoke-ArtCraftBatch($request, $catalog) {
+    if ($request.items.Count -lt 1 -or $request.items.Count -gt 64) { throw 'Invalid batch size' }
+    if ($request.port -lt 1 -or $request.port -gt 65535) { throw 'Invalid local source port' }
+    $root = New-ProtectedRun ([string]$request.session)
+    $results = [IO.File]::Open([IO.Path]::Combine($root, 'results'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    $writer = [IO.StreamWriter]::new($results, [Text.UTF8Encoding]::new($false))
+    $writer.AutoFlush = $true
+    try {
+        for ($i = 0; $i -lt $request.items.Count; $i++) {
+            $item = $request.items[$i]
+            $code = 'rejected'
+            $staged = [IO.Path]::Combine($root, "$i.msi")
+            try {
+                $authorization = Get-ReleaseAuthorization $item $catalog
+                $staged = Copy-VerifiedPackage $item $authorization $root $i $request.port $request.session
+                # Check immediately before each installation, including apps started during UAC.
+                if (Test-AppRunning $authorization.app) { $code = 'running' }
+                else {
+                    $locked = [IO.File]::Open($staged, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+                    try {
+                        $start = New-Object Diagnostics.ProcessStartInfo
+                        $start.FileName = [IO.Path]::Combine([Environment]::SystemDirectory, 'msiexec.exe')
+                        $start.WorkingDirectory = [Environment]::SystemDirectory
+                        $start.UseShellExecute = $false
+                        # Logs live with the protected staged package; no user-writable log paths.
+                        $start.Arguments = '/i "' + $staged + '" /qn /norestart ALLUSERS=1 /l*v "' + [IO.Path]::Combine($root, "$i.log") + '"'
+                        if ($null -ne $item.destination) {
+                            $destination = Assert-InstallDestination ([string]$item.destination)
+                            # Always pass a trailing separator, doubled before the closing quote
+                            # for Windows argument decoding (including a drive-root folder).
+                            $start.Arguments += ' INSTALLFOLDER="' + $destination.TrimEnd('\') + '\\"'
+                        }
+                        $child = [Diagnostics.Process]::Start($start)
+                        try { $child.WaitForExit(); $code = [string]$child.ExitCode }
+                        finally { $child.Dispose() }
+                    } finally { $locked.Dispose() }
+                }
+            } catch {
+                # Deliberately return fixed codes, not exception text containing source data.
+                $code = 'rejected'
+            } finally {
+                [IO.File]::Delete($staged)
+            }
+            $writer.WriteLine("$i $code")
+        }
+    } finally { $writer.Dispose(); $results.Dispose() }
+}
+"#;
+
+#[cfg(any(windows, test))]
+fn encode_command(script: &str) -> String {
+    use base64::Engine as _;
+    let bytes: Vec<_> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[cfg(any(windows, test))]
+fn compressed_command(script: &str) -> Result<String, String> {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(script.as_bytes()).map_err(|e| e.to_string())?;
+    let data = base64::engine::general_purpose::STANDARD.encode(gzip.finish().map_err(|e| e.to_string())?);
+    Ok(encode_command(&format!(
+        "$m=[IO.MemoryStream]::new([Convert]::FromBase64String('{data}')); \
+         $g=[IO.Compression.GZipStream]::new($m,[IO.Compression.CompressionMode]::Decompress); \
+         $r=[IO.StreamReader]::new($g); & ([ScriptBlock]::Create($r.ReadToEnd()))"
+    )))
+}
+
+#[cfg(any(windows, test))]
+fn batch_script(session: &str, port: u16, items: &[Item]) -> Result<String, String> {
+    use base64::Engine as _;
+    #[derive(Serialize)]
+    struct CatalogApp {
+        id: &'static str,
+        repo: &'static str,
+        names: Vec<&'static str>,
+        stems: Vec<&'static str>,
+    }
+    let catalog: Vec<_> = artcraft_launcher_core::catalog::SUITE
+        .iter()
+        .map(|app| CatalogApp { id: app.id, repo: app.repo, names: app.names().collect(), stems: app.stems().collect() })
+        .collect();
+    // Filesystem source paths never cross the privilege boundary.
+    let items: Vec<_> = items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "release": item.release, "sha256": item.sha256, "destination": item.destination
+            })
+        })
+        .collect();
+    let request = serde_json::json!({ "session": session, "port": port, "items": items });
+    let json = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    let catalog = serde_json::to_vec(&catalog).map_err(|e| e.to_string())?;
+    let data = base64::engine::general_purpose::STANDARD.encode(json);
+    let catalog = base64::engine::general_purpose::STANDARD.encode(catalog);
+    Ok(format!(
+        "{POLICY}\ntry {{\n$request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{data}')) | ConvertFrom-Json\n\
+         $catalog = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{catalog}')) | ConvertFrom-Json\n\
+         Invoke-ArtCraftBatch $request $catalog\nexit 0\n}} catch {{ exit 1 }}\n"
+    ))
+}
+
 #[cfg(windows)]
-pub fn install(items: &[Item], paths: &Paths, report: &mut dyn FnMut(usize, Report)) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
+pub fn system_powershell() -> Result<PathBuf, String> {
+    system_directory().map(|dir| dir.join(r"WindowsPowerShell\v1.0\powershell.exe"))
+}
 
-    static RUNS: AtomicU64 = AtomicU64::new(0);
-    const ELEVATE: &str = "$ErrorActionPreference = 'Stop'; try { $p = Start-Process -FilePath $env:ARTCRAFT_LAUNCHER_HELPER -ArgumentList $env:ARTCRAFT_LAUNCHER_HELPER_ARGS -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode } catch { $e = $_.Exception; while ($e) { if ($e.NativeErrorCode -eq 1223) { exit 1223 }; $e = $e.InnerException }; exit 1 }";
+#[cfg(windows)]
+fn system_directory() -> Result<PathBuf, String> {
+    winsafe::GetSystemDirectory().map(PathBuf::from).map_err(|e| format!("couldn't locate Windows' system directory ({e})"))
+}
 
-    let fail_all = |report: &mut dyn FnMut(usize, Report), error: String| {
+#[cfg(windows)]
+pub fn install(items: &[Item], report: &mut dyn FnMut(usize, crate::msi_batch::Report)) {
+    use crate::msi_batch::Report;
+    use artcraft_launcher_core::protocol::JobPhase;
+
+    let fail = |error: String, report: &mut dyn FnMut(usize, Report)| {
         for i in 0..items.len() {
             report(i, Report::Done(Err(error.clone())));
         }
     };
-    let downloads = paths.downloads();
-    let results = downloads.join(format!(".msi-batch-{}-{}.results", std::process::id(), RUNS.fetch_add(1, Ordering::SeqCst)));
-    let prepared = std::fs::create_dir_all(&downloads)
-        .map_err(|e| format!("couldn't create {} ({e})", downloads.display()))
-        .and_then(|()| std::env::current_exe().map_err(|e| format!("couldn't find ArtCraft Launcher's program ({e})")))
-        .and_then(|exe| argument_line(&results, &downloads, &exe, items));
-    let (exe, args) = match prepared {
-        Ok(p) => p,
-        Err(e) => return fail_all(report, e),
+    let prepared = (|| {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).map_err(|e| format!("couldn't create an installer session ({e})"))?;
+        let session = crate::http::hex(&random);
+        let source = crate::msi_source::Source::new(items, &session)?;
+        let system = system_directory()?;
+        let powershell = system_powershell()?;
+        let script = compressed_command(&batch_script(&session, source.port, items)?)?;
+        // The unelevated launcher asks the OS to elevate ONLY its system PowerShell executable.
+        // Both paths/code are data, never interpolation of MSI/path strings into shell source.
+        let host = powershell.to_str().ok_or("unusual Windows system path")?.replace('\'', "''");
+        let cwd = system.to_str().ok_or("unusual Windows system path")?.replace('\'', "''");
+        let outer = format!(
+            "$ErrorActionPreference='Stop'; try {{ $p = Start-Process -FilePath '{host}' -WorkingDirectory '{cwd}' \
+             -ArgumentList '-NoProfile -NonInteractive -EncodedCommand {script}' -Verb RunAs -Wait -PassThru; exit $p.ExitCode \
+             }} catch {{ $e=$_.Exception; while ($e) {{ if ($e.NativeErrorCode -eq 1223) {{ exit 1223 }}; $e=$e.InnerException }}; exit 1 }}"
+        );
+        // Avoid the Windows 32K command line limit before asking for UAC.
+        if outer.len() > 30000 {
+            return Err("the MSI batch command is too large for Windows".into());
+        }
+        let results = system.join(format!("ArtCraft-MSI-{session}")).join("results");
+        let mut command = crate::process::command(powershell);
+        command.env_clear().current_dir(&system);
+        if let Some(root) = system.parent() {
+            command.env("SystemRoot", root).env("WINDIR", root);
+        }
+        command.env("PATH", &system);
+        command.args(["-NoProfile", "-NonInteractive", "-Command", &outer]);
+        command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        Ok((command, results, source))
+    })();
+    let (mut command, results, _source) = match prepared {
+        Ok(prepared) => prepared,
+        Err(e) => return fail(e, report),
     };
-    let _ = std::fs::remove_file(&results);
     for i in 0..items.len() {
-        report(i, Report::Phase(artcraft_launcher_core::protocol::JobPhase::Permission));
+        report(i, Report::Phase(JobPhase::Permission));
     }
-    let mut command = crate::process::command(system_powershell());
-    command
-        .args(["-NoProfile", "-NonInteractive", "-Command", ELEVATE])
-        .env("ARTCRAFT_LAUNCHER_HELPER", &exe)
-        .env("ARTCRAFT_LAUNCHER_HELPER_ARGS", &args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(e) => return fail_all(report, format!("couldn't ask Windows for permission ({e})")),
-    };
-    let code = loop {
-        let exited = match child.try_wait() {
-            Ok(status) => status.map(|status| status.code()),
-            Err(_) => Some(None),
-        };
-        if let Some(code) = exited {
-            break code;
-        }
-        std::thread::sleep(Duration::from_millis(150));
+        Err(e) => return fail(format!("couldn't ask Windows for permission ({e})"), report),
     };
     let mut done = vec![false; items.len()];
-    // The results path is user-writable, so do not trust a file an unprivileged process created
-    // while UAC was open. The helper holds the file exclusively against writes/deletes and a
-    // successful exit proves it created and completed that file.
-    if code == Some(0) {
-        if let Ok(text) = std::fs::read_to_string(&results) {
-            for i in 0..items.len() {
-                report(i, Report::Phase(artcraft_launcher_core::protocol::JobPhase::Installing));
+    let mut started = false;
+    let exit = loop {
+        let exit = child.try_wait();
+        if let Ok(Some(text)) = read_results(&results) {
+            if !started {
+                started = true;
+                for i in 0..items.len() {
+                    report(i, Report::Phase(JobPhase::Installing));
+                }
             }
-            for (i, outcome) in parse_results(&text, items.len()) {
+            for (i, result) in parse_results(&text, items.len()) {
                 if let Some(finished) = done.get_mut(i).filter(|finished| !**finished) {
                     *finished = true;
-                    report(i, Report::Done(outcome));
+                    report(i, Report::Done(result));
                 }
             }
         }
-    }
-    let _ = std::fs::remove_file(&results);
-    let missing = match code {
-        Some(DECLINED) => artcraft_launcher_core::protocol::CANCELLED.to_string(),
-        Some(0) => "the Windows Installer stopped before reporting its result".into(),
-        _ => "the Windows Installer stopped before installing it".into(),
+        match exit {
+            Ok(Some(status)) => break status.code(),
+            Err(_) => break None,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(150)),
+        }
     };
-    for (i, finished) in done.iter().enumerate().filter(|(_, finished)| !**finished) {
-        report(i, Report::Done(Err(missing.clone())));
+    for (i, _) in done.iter().enumerate().filter(|(_, done)| !**done) {
+        let error = if exit == Some(1223) {
+            "cancelled".into()
+        } else {
+            "Windows didn't complete the verified MSI batch. Check the protected installer logs or try again.".into()
+        };
+        report(i, Report::Done(Err(error)));
     }
 }
 
+/// Results never pass through a user-owned cache path. Bound reads even if another administrator
+/// tampers with the protocol. The protected system-directory parent supplies authenticity.
 #[cfg(windows)]
-fn argument_line(results: &Path, downloads: &Path, exe: &Path, items: &[Item]) -> Result<(PathBuf, String), String> {
-    let mut line = String::new();
-    for arg in helper_args(results, downloads, items) {
-        let arg = arg.to_str().ok_or("a download's path has characters Windows can't pass on")?;
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(&windows_quote(arg));
-    }
-    Ok((exe.to_path_buf(), line))
-}
-
-#[cfg(windows)]
-fn windows_quote(arg: &str) -> String {
-    let mut out = String::from('"');
-    let mut backslashes = 0;
-    for c in arg.chars() {
-        match c {
-            '\\' => backslashes += 1,
-            '"' => {
-                out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
-                out.push('"');
-                backslashes = 0;
-            }
-            _ => {
-                out.extend(std::iter::repeat_n('\\', backslashes));
-                out.push(c);
-                backslashes = 0;
-            }
-        }
-    }
-    out.extend(std::iter::repeat_n('\\', backslashes * 2));
-    out.push('"');
-    out
-}
-
-#[cfg(windows)]
-fn system_powershell() -> PathBuf {
-    system_directory().join(r"WindowsPowerShell\v1.0\powershell.exe")
-}
-
-#[cfg(windows)]
-fn system_directory() -> PathBuf {
-    winsafe::GetSystemDirectory().map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(r"C:\Windows\System32"))
-}
-
-#[cfg(windows)]
-fn run_batch(results: &Path, downloads: &Path, items: &[Item], reference: &Path) -> u8 {
-    use std::io::Write as _;
-
-    let Ok(downloads) = safe_directory(downloads) else { return 2 };
-    if !same_directory(results, &downloads) || std::fs::symlink_metadata(results).is_ok() {
-        return 2;
-    }
-    use std::os::windows::fs::OpenOptionsExt;
-    let Ok(mut out) = std::fs::OpenOptions::new().write(true).create_new(true).share_mode(0x1).open(results) else { return 3 };
-    for (index, item) in items.iter().enumerate() {
-        let result = install_one(item, &downloads, reference);
-        if writeln!(out, "{index} {result}").and_then(|()| out.flush()).is_err() {
-            return 3;
-        }
-    }
-    0
-}
-
-#[cfg(windows)]
-fn safe_directory(path: &Path) -> Result<PathBuf, ()> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| ())?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(());
-    }
-    dunce::canonicalize(path).map_err(|_| ())
-}
-
-#[cfg(windows)]
-fn same_directory(path: &Path, directory: &Path) -> bool {
-    path.parent().and_then(|parent| dunce::canonicalize(parent).ok()).is_some_and(|parent| parent == directory)
-}
-
-#[cfg(windows)]
-fn install_one(item: &Item, downloads: &Path, reference: &Path) -> String {
-    let Ok(metadata) = std::fs::symlink_metadata(&item.msi) else { return UNREADABLE.into() };
-    if !metadata.is_file() || metadata.file_type().is_symlink() || !same_directory(&item.msi, downloads) {
-        return REJECTED.into();
-    }
-    let Ok(file) = open_for_reading_only(&item.msi) else { return UNREADABLE.into() };
-    let mut hasher = Sha256::new();
-    if std::io::copy(&mut &file, &mut hasher).is_err() {
-        return UNREADABLE.into();
-    }
-    if crate::http::hex(&hasher.finalize()) != item.sha256 {
-        return CHANGED.into();
-    }
-    if crate::self_update::signed_like(reference, &item.msi).is_err() {
-        return UNSIGNED.into();
-    }
-    let code = run_msiexec(item);
-    drop(file);
-    code.map_or_else(|| INTERRUPTED.to_string(), |code| code.to_string())
-}
-
-#[cfg(windows)]
-fn open_for_reading_only(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new().read(true).share_mode(0x1).open(path)
-}
-
-#[cfg(windows)]
-fn run_msiexec(item: &Item) -> Option<i32> {
-    use std::os::windows::process::CommandExt;
-    let msi = crate::install::msi_path(&item.msi).ok()?;
-    let mut command = crate::process::command(system_msiexec());
-    // Explicitly request a per-machine install. The helper runs under the administrator who
-    // accepted UAC; without this public property an otherwise valid per-user MSI could land in
-    // that administrator's profile instead of updating the user's installed app.
-    // Do not let elevated Windows Installer write beside a user-owned MSI: a pre-created
-    // junction or symlink there could redirect the log to an administrator-owned file.
-    command.arg("/i").arg(&msi).args(["/qn", "/norestart", "ALLUSERS=1", "/l*v", "NUL"]);
-    if let Some(destination) = &item.destination {
-        command.raw_arg(crate::install::msi_folder_argument(destination).ok()?);
-    }
-    command.status().ok()?.code()
-}
-
-#[cfg(windows)]
-fn system_msiexec() -> PathBuf {
-    system_directory().join("msiexec.exe")
+fn read_results(path: &Path) -> Result<Option<String>, String> {
+    use std::io::Read as _;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut text = String::new();
+    file.take(65536).read_to_string(&mut text).map_err(|e| e.to_string())?;
+    Ok(Some(text))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn downloads() -> PathBuf {
-        #[cfg(windows)]
-        return PathBuf::from(r"C:\Users\Ann Lee\ArtCraft Launcher\cache\downloads");
-        #[cfg(not(windows))]
-        return PathBuf::from("/tmp/ArtCraft Launcher/cache/downloads");
-    }
-
-    fn item(name: &str) -> Item {
-        Item { msi: downloads().join(name), sha256: "a".repeat(64), destination: None }
-    }
-
-    fn destination() -> PathBuf {
-        #[cfg(windows)]
-        return PathBuf::from(r"C:\Program Files\PhotoCraft");
-        #[cfg(not(windows))]
-        return PathBuf::from("/opt/PhotoCraft");
+    fn asset(url: &str) -> release::Asset {
+        release::Asset { name: "photocraft-0.5.0-windows-x64.msi".into(), url: url.into(), ..Default::default() }
     }
 
     #[test]
-    fn arguments_round_trip_and_unexpected_shapes_are_refused() {
-        let results = downloads().join(".batch.results");
-        let downloads = results.parent().unwrap().to_path_buf();
-        let items = vec![item("Photo Craft.msi"), Item { destination: Some(destination()), ..item("Other.msi") }];
-        assert_eq!(parse_args(&helper_args(&results, &downloads, &items)), Some((results.clone(), downloads.clone(), items)));
+    fn obsolete_helper_always_refuses_direct_calls() {
+        assert_eq!(helper_main(&["C:\\arbitrary".into(), "a".repeat(64).into()]), 2);
+    }
+
+    #[test]
+    fn authorization_identity_is_pinned_to_app_repository_version_and_asset() {
+        let app = CraftApp::by_id("photocraft").unwrap();
+        let prefix = "https://github.com/storytold/photocraft/releases/download/v0.5.0/";
+        let good = asset(&format!("{prefix}photocraft-0.5.0-windows-x64.msi"));
+        assert_eq!(release_identity(app, &good).unwrap().tag, "v0.5.0");
         for bad in [
-            vec![results.clone().into_os_string()],
-            vec![results.clone().into_os_string(), downloads.clone().into_os_string()],
-            vec![
-                PathBuf::from("relative").into_os_string(),
-                downloads.clone().into_os_string(),
-                item("a.msi").msi.into_os_string(),
-                "a".repeat(64).into(),
-                OsString::new(),
-            ],
-            vec![
-                results.clone().into_os_string(),
-                downloads.clone().into_os_string(),
-                PathBuf::from(r"C:\x.exe").into_os_string(),
-                "a".repeat(64).into(),
-                OsString::new(),
-            ],
-            vec![
-                results.clone().into_os_string(),
-                downloads.into_os_string(),
-                item("a.msi").msi.into_os_string(),
-                "A".repeat(64).into(),
-                OsString::new(),
-            ],
+            good.url.replace("storytold/", "attacker/"),
+            good.url.replace("/v0.5.0/", "/v0.6.0/"),
+            good.url.replace("/v0.5.0/", "/../"),
+            good.url.replace("/v0.5.0/", "/%2e%2e/"),
+            good.url.replace("photocraft/releases", "filmcraft/releases"),
+            format!("{}?x=1", good.url),
+            good.url.replace("windows-x64.msi", "windows-x64.exe"),
         ] {
-            assert_eq!(parse_args(&bad), None, "{bad:?}");
+            assert!(release_identity(app, &asset(&bad)).is_err(), "{bad}");
         }
     }
 
     #[test]
-    fn results_are_parsed_incrementally_and_only_once() {
-        let parsed = parse_results("0 0\n2 3010\n1 changed\n1 0\n3 nonsense\n4 unreadable\n5 unsigned\n6 rejected\n7 interrupted\n", 8);
-        assert_eq!(parsed[0], (0, Ok(())));
-        assert_eq!(parsed[1], (2, Ok(())));
-        assert!(parsed.iter().any(|(i, result)| *i == 1 && result.is_err()));
-        assert_eq!(parsed.len(), 7);
+    fn results_reject_torn_duplicate_and_out_of_range_reports() {
+        let results = parse_results("0 0\n1 rejected\n0 1603\n9 0\n2 3010\n3 running\n4 1602\n5 0", 6);
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0], (0, Ok(())));
+        assert!(results[1].1.is_err());
+        assert_eq!(results[2], (2, Ok(())));
+        assert_eq!(results[4], (4, Err("cancelled".into())));
     }
 
     #[test]
-    fn installer_codes_preserve_cancellation_and_reboot_success() {
-        assert_eq!(msi_outcome(Some(0)), Ok(()));
+    fn encoded_policy_has_no_request_code_or_per_user_executable() {
+        use base64::Engine as _;
+        let encoded = encode_command("hello '\u{1f600}'");
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+        let utf16: Vec<_> = bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
+        assert_eq!(String::from_utf16(&utf16).unwrap(), "hello '\u{1f600}'");
+        let script = batch_script(&"a".repeat(32), 12345, &[]).unwrap();
+        assert!(script.contains("Read-OfficialChecksums"));
+        assert!(!script.contains("current_exe"));
+        let compressed = compressed_command(&script).unwrap();
+        assert!(compressed.len() < 25000, "must fit Windows' command line: {}", compressed.len());
+        let bytes = base64::engine::general_purpose::STANDARD.decode(compressed).unwrap();
+        let utf16: Vec<_> = bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
+        let bootstrap = String::from_utf16(&utf16).unwrap();
+        let gzip = bootstrap.split('\'').nth(1).unwrap();
+        let gzip = base64::engine::general_purpose::STANDARD.decode(gzip).unwrap();
+        let mut decoder = flate2::read::GzDecoder::new(gzip.as_slice());
+        let mut decoded = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut decoded).unwrap();
+        assert_eq!(decoded, script);
+    }
+
+    #[test]
+    fn cancellation_and_reboot_codes_are_preserved() {
         assert_eq!(msi_outcome(Some(3010)), Ok(()));
-        assert_eq!(msi_outcome(Some(1602)), Err("cancelled".into()));
+        assert_eq!(msi_outcome(Some(1641)), Ok(()));
+        assert_eq!(msi_outcome(Some(1223)), Err("cancelled".into()));
         assert!(msi_outcome(Some(1618)).unwrap_err().contains("another installation"));
-        assert_eq!(msi_outcome(None), Err("the Windows Installer was interrupted".into()));
     }
 }

@@ -74,9 +74,19 @@ impl Queue {
         self.changed.wait_timeout(state, Duration::from_millis(100)).unwrap_or_else(PoisonError::into_inner).0
     }
 
+    /// Tries to reserve the installer without blocking. Dropping the permit releases it.
+    /// This lets MSI batches wait on both downloads and this queue while remaining cancellable.
+    pub fn try_claim(&self) -> Option<impl Drop + '_> {
+        let mut state = self.lock();
+        if state.busy {
+            return None;
+        }
+        state.busy = true;
+        Some(Turn { queue: self, others: Vec::new(), outcome: Ok(()) })
+    }
+
     /// Runs `work` once no other installer is running. `turn(true)` says it has to wait,
-    /// `turn(false)` that the wait is over. `None` when `cancelled` (asked a few times a second,
-    /// so it must not block) said so during the wait; `work` then never ran.
+    /// `turn(false)` that the wait is over. `None` when cancelled during the wait.
     pub fn alone<R>(&self, cancelled: &dyn Fn() -> bool, turn: &mut dyn FnMut(bool), work: impl FnOnce() -> R) -> Option<R> {
         let mut state = self.lock();
         let mut waited = false;

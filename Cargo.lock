@@ -314,6 +314,7 @@ name = "artcraft-launcher-native"
 version = "0.7.0"
 dependencies = [
  "artcraft-launcher-core",
+ "base64 0.22.1",
  "dirs 6.0.0",
  "dunce",
  "flate2",

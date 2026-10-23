@@ -125,11 +125,16 @@ pub fn install_at(
         }
         #[cfg(windows)]
         PackageKind::Msi => {
-            let item = crate::msi_batch::Item { msi: file.clone(), sha256: downloaded.sha256.clone(), destination: destination.clone() };
+            let item = crate::msi_batch::Item {
+                msi: file.clone(),
+                sha256: downloaded.sha256.clone(),
+                destination: destination.clone(),
+                release: crate::elevated::release_identity(app, asset)?,
+            };
             let ticket = msi_ticket.ok_or("the Windows MSI batch wasn't prepared")?;
             ticket
                 .install(item, &cancelled(job.stop), &mut *job.phase, &|items, reports| {
-                    crate::elevated::install(items, job.paths, reports);
+                    crate::elevated::install(items, reports);
                 })
                 .map(|_| None)
         }
@@ -738,8 +743,10 @@ pub fn failed_in_shared_call(error: &str) -> bool {
 }
 
 /// The system's installer runs one job at a time; the others wait their turn here.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(target_os = "linux")]
 static INSTALLER: crate::queue::Queue = crate::queue::Queue::new();
+#[cfg(windows)]
+static INSTALLER: &crate::queue::Queue = &crate::msi_batch::BATCH.installer;
 
 /// For [`INSTALLER`]: reports [`JobPhase::Waiting`] while a job waits, then `working` again.
 #[cfg(any(target_os = "linux", windows))]
@@ -1566,7 +1573,7 @@ pub mod windows {
     use super::*;
 
     fn msiexec() -> PathBuf {
-        std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from).join(r"System32\msiexec.exe")
+        winsafe::GetSystemDirectory().map_or_else(|_| PathBuf::from(r"C:\Windows\System32"), PathBuf::from).join("msiexec.exe")
     }
 
     fn explain(code: Option<i32>) -> Result<(), String> {
@@ -1599,8 +1606,12 @@ pub mod windows {
     /// Runs the launcher's own new MSI for a self-update, with the same progress window and no
     /// restart as [`run_msi`], and waits for it.
     pub fn reinstall(msi: &Path) -> Result<(), String> {
-        let status = msi_command(&msiexec(), msi)?.status().map_err(|e| format!("couldn't start the Windows Installer ({e})"))?;
-        explain(status.code())
+        INSTALLER
+            .alone(&|| false, &mut |_| {}, || {
+                let status = msi_command(&msiexec(), msi)?.status().map_err(|e| format!("couldn't start the Windows Installer ({e})"))?;
+                explain(status.code())
+            })
+            .unwrap_or_else(|| Err("the Windows Installer was interrupted".into()))
     }
 
     /// Runs `work` once no other Windows Installer job of ours is running (a second one would

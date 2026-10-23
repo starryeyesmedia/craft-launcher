@@ -17,6 +17,8 @@ pub mod install;
 pub mod login;
 pub mod manifest;
 pub mod msi_batch;
+#[cfg(any(windows, test))]
+mod msi_source;
 pub mod packages;
 pub mod paths;
 #[cfg(windows)]

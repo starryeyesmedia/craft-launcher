@@ -14,11 +14,12 @@ use artcraft_launcher_core::protocol::{CANCELLED, JobPhase};
 type Outcome = Result<(), String>;
 
 /// A downloaded MSI and the published SHA-256 it must still match when elevated.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Item {
     pub msi: PathBuf,
     pub sha256: String,
     pub destination: Option<PathBuf>,
+    pub release: crate::elevated::ReleaseIdentity,
 }
 
 /// A phase or result reported for one item in a batch.
@@ -48,6 +49,7 @@ pub static BATCH: Batch = Batch::new();
 pub struct Batch {
     state: Mutex<State>,
     changed: Condvar,
+    pub(crate) installer: crate::queue::Queue,
 }
 
 impl Default for Batch {
@@ -59,7 +61,7 @@ impl Default for Batch {
 impl Batch {
     pub const fn new() -> Self {
         let state = State { slots: 0, downloading: 0, next_id: 0, ready: Vec::new(), busy: false, running: Vec::new(), finished: Vec::new() };
-        Self { state: Mutex::new(state), changed: Condvar::new() }
+        Self { state: Mutex::new(state), changed: Condvar::new(), installer: crate::queue::Queue::new() }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -82,10 +84,10 @@ impl Batch {
     /// worker threads have started.
     pub fn begin(&self, count: usize) -> bool {
         let mut state = self.lock();
-        if count == 0 || state.busy || state.slots != 0 || state.downloading != 0 || !state.ready.is_empty() {
+        if count == 0 {
             return false;
         }
-        state.slots = count;
+        state.slots += count;
         true
     }
 
@@ -169,7 +171,7 @@ impl Ticket<'_> {
         state.ready.push((id, item));
         batch.changed.notify_all();
         let mut told_waiting = false;
-        loop {
+        let _installer = loop {
             if let Some(at) = state.finished.iter().position(|(done, _)| *done == id) {
                 return state.finished.swap_remove(at).1;
             }
@@ -189,8 +191,12 @@ impl Ticket<'_> {
                 batch.changed.notify_all();
                 return Err(CANCELLED.into());
             }
-            if !state.busy && state.slots == 0 && state.downloading == 0 {
-                break;
+            if !state.busy
+                && state.slots == 0
+                && state.downloading == 0
+                && let Some(permit) = batch.installer.try_claim()
+            {
+                break permit;
             }
             if told_waiting {
                 state = batch.wait(state);
@@ -200,7 +206,7 @@ impl Ticket<'_> {
                 phase(JobPhase::Waiting);
                 state = batch.lock();
             }
-        }
+        };
 
         let taken = std::mem::take(&mut state.ready);
         state.busy = true;
@@ -242,7 +248,12 @@ mod tests {
     use super::*;
 
     fn item(name: &str) -> Item {
-        Item { msi: PathBuf::from(name), sha256: "0".repeat(64), destination: None }
+        Item {
+            msi: PathBuf::from(name),
+            sha256: "0".repeat(64),
+            destination: None,
+            release: crate::elevated::ReleaseIdentity { app: "photocraft".into(), tag: "v0.5.0".into(), asset: name.into() },
+        }
     }
 
     #[test]
@@ -344,5 +355,50 @@ mod tests {
             assert_eq!(first_worker.join().unwrap(), Ok(()));
             assert_eq!(second_worker.join().unwrap(), Ok(()));
         });
+    }
+
+    #[test]
+    fn an_msi_batch_and_an_uninstall_share_the_same_installer_permit() {
+        let batch = Batch::new();
+        let ticket = batch.join();
+        let (started, heard) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (waiting, waited) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let install = scope.spawn(move || {
+                ticket.install(item("a.msi"), &|| false, &mut |_| {}, &|_, report| {
+                    started.send(()).unwrap();
+                    released.recv().unwrap();
+                    report(0, Report::Done(Ok(())));
+                })
+            });
+            heard.recv_timeout(Duration::from_secs(2)).unwrap();
+            let uninstall = scope.spawn(|| {
+                batch.installer.alone(
+                    &|| false,
+                    &mut |turn| {
+                        if turn {
+                            waiting.send(()).unwrap();
+                        }
+                    },
+                    || 42,
+                )
+            });
+            waited.recv_timeout(Duration::from_secs(2)).unwrap();
+            release.send(()).unwrap();
+            assert_eq!(install.join().unwrap(), Ok(()));
+            assert_eq!(uninstall.join().unwrap(), Some(42));
+        });
+    }
+
+    #[test]
+    fn a_batch_waiting_for_uninstall_stays_cancellable() {
+        let batch = Batch::new();
+        let permit = batch.installer.try_claim().unwrap();
+        let ticket = batch.join();
+        assert_eq!(ticket.install(item("a.msi"), &|| true, &mut |_| {}, &|_, _| panic!("cancelled batch ran")), Err(CANCELLED.into()));
+        drop(permit);
+        let ticket = batch.join();
+        assert_eq!(ticket.install(item("b.msi"), &|| false, &mut |_| {}, &|_, report| report(0, Report::Done(Ok(())))), Ok(()));
     }
 }

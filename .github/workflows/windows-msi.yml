@@ -1,0 +1,37 @@
+name: Windows MSI security
+
+on:
+  push:
+    branches: [fix/windows-batched-uac]
+  pull_request:
+    paths:
+      - crates/native/**
+      - apps/artcraft-launcher/**
+      - Cargo.lock
+      - .github/workflows/windows-msi.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-msi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Check Windows MSVC compilation
+        run: cargo check --workspace --all-targets --locked --target x86_64-pc-windows-msvc
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
+      - name: Windows unit and integration tests
+        run: cargo test --workspace --locked --target x86_64-pc-windows-msvc
+

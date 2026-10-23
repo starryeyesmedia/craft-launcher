@@ -150,6 +150,11 @@ Release assets (keep these names exact; the launcher's own self-update and the R
 
 Packaging facts the code relies on:
 
+- Craft App MSI updates use a verified per-machine batch with one UAC approval, then `/qn
+  /norestart`. The GUI remains unelevated; the fixed system-hosted policy verifies official
+  checksums, signatures and MSI scope before installing. See `docs/windows-msi-security.md`.
+  The launcher's own per-user self-update below continues to use `/passive`.
+
 - The Windows MSI is **per-user** (no UAC prompt), by default into
   `%LOCALAPPDATA%\Programs\ArtCraft Launcher`. Double-clicked it opens a WixUI setup wizard
   (Welcome; a folder page with a "Create a desktop shortcut" box; Ready; progress; Finish with
