@@ -84,6 +84,7 @@ try {
             $package = [pscustomobject]@{
                 app = $id; version = $version; asset = $asset; checksum = 'not-run'; signature = 'not-run'
                 publisher = $null; identityScope = 'not-run'; productCode = $null; error = $null
+                validationStage = 'published checksums'; metadata = $null
             }
             $report.packages += $package
             try {
@@ -92,28 +93,39 @@ try {
                 $sha = Get-PublishedHash $sums $asset
                 [IO.File]::WriteAllText((Join-Path $root "$asset.SHA256SUMS.txt"), $sums)
                 $file = Join-Path $root $asset
+                $package.validationStage = 'MSI download and SHA-256'
                 Invoke-WebRequest "$url/$asset" -OutFile $file -UseBasicParsing -UserAgent 'ArtCraft-Launcher/MSI-E2E'
                 if ((Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant() -cne $sha) { throw 'Official checksum mismatch' }
                 $package.checksum = $sha
+                $package.validationStage = 'Authenticode publisher'
                 $sig = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $file
                 $package.signature = [string]$sig.Status
                 if ($null -ne $sig.SignerCertificate) {
                     $package.publisher = $sig.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
                 }
                 Assert-OfficialSignature $file
-                Assert-MsiIdentity $file ([pscustomobject]@{names=@($name)}) $version
-                $package.identityScope = 'passed: ALLUSERS=1; MSIINSTALLPERUSER absent/0; official name/manufacturer/version'
+                $package.validationStage = 'MSI identity and per-machine scope'
                 $api = New-MsiApi
                 $msiArgs = [object[]]@($file, [IntPtr]::Zero, [uint32]0)
                 if ($api.GetMethod('MsiOpenDatabaseW').Invoke($null, $msiArgs) -ne 0) { throw 'Cannot read ProductCode' }
-                try { $package.productCode = Get-MsiProperty $api ([uint32]$msiArgs[2]) 'ProductCode' }
+                try {
+                    $metadata = [ordered]@{}
+                    foreach ($property in @('ProductCode','ProductName','Manufacturer','ProductVersion','ALLUSERS','MSIINSTALLPERUSER')) {
+                        $metadata[$property] = Get-MsiProperty $api ([uint32]$msiArgs[2]) $property
+                    }
+                    $package.metadata = [pscustomobject]$metadata
+                    $package.productCode = $metadata.ProductCode
+                }
                 finally { $null = $api.GetMethod('MsiCloseHandle').Invoke($null, [object[]]@([uint32]$msiArgs[2])) }
+                Assert-MsiIdentity $file ([pscustomobject]@{names=@($name)}) $version
+                $package.identityScope = 'passed: ALLUSERS=1; MSIINSTALLPERUSER absent/0; official name/manufacturer/version'
                 if ($package.productCode -cnotmatch '^\{[A-Fa-f0-9-]{36}\}$') { throw 'Invalid ProductCode' }
                 # Save the real GitHub API release answer for the Rust backend's pinned update.
+                $package.validationStage = 'official GitHub release metadata'
                 Invoke-WebRequest "https://api.github.com/repos/storytold/$id/releases/tags/v$version" `
                     -OutFile (Join-Path $root "$id-v$version.json") -UseBasicParsing -UserAgent 'ArtCraft-Launcher/MSI-E2E'
             } catch {
-                $package.error = 'Official package preflight incompatible: checksum, signature, MSI identity/scope or release metadata'
+                $package.error = "Official package preflight failed: $($package.validationStage)"
             }
         }
         if (@($report.packages | Where-Object { $null -ne $_.error }).Count -ne 0) { throw 'Official package preflight failed; no MSI was installed' }

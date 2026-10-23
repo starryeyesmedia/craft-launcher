@@ -120,6 +120,18 @@ fn batch(root: &Path) -> Result<(), String> {
     if failures.len() != 2 || failures.iter().any(|f| f["rejected"] != true) {
         return Err("protected policy accepted a forged checksum or changed package".into());
     }
+    let sessions = crate::elevated::hosted_test::SESSIONS.lock().unwrap();
+    if sessions.len() != 2 {
+        return Err("expected one successful batch and one negative-case batch".into());
+    }
+    let negative_session = sessions.last().ok_or("missing negative-case session")?;
+    let system = winsafe::GetSystemDirectory().map_err(|e| e.to_string())?;
+    let text =
+        std::fs::read_to_string(Path::new(&system).join(format!("ArtCraft-MSI-{negative_session}")).join("results")).map_err(|e| e.to_string())?;
+    if text.lines().collect::<Vec<_>>() != ["0 rejected", "1 rejected"] {
+        return Err("negative cases did not produce explicit protected-policy rejections".into());
+    }
+    drop(sessions);
     run_script(root, "verify")
 }
 
