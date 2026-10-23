@@ -10,6 +10,11 @@ on:
       - Cargo.lock
       - .github/workflows/windows-msi.yml
   workflow_dispatch:
+    inputs:
+      package_vm:
+        description: Build and upload an unsigned x64 portable launcher for VM testing
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -34,4 +39,63 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
       - name: Windows unit and integration tests
         run: cargo test --workspace --locked --target x86_64-pc-windows-msvc
+
+  vm-test-package:
+    if: github.event_name == 'workflow_dispatch' && inputs.package_vm && github.ref == 'refs/heads/fix/windows-batched-uac'
+    needs: windows-msvc
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      ARTCRAFT_LAUNCHER_BUILD_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-vm-release
+      - name: Install existing packaging prerequisites
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          if ($LASTEXITCODE -ne 0) { throw 'WiX installation failed' }
+          wix extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2
+          if ($LASTEXITCODE -ne 0) { throw 'WiX extension installation failed' }
+      # No signing secrets are passed. The existing packaging recipe supports unsigned
+      # development launchers; runtime verification of official app MSIs is unchanged.
+      - name: Build actual launcher and portable runtime bundle
+        shell: pwsh
+        run: ./packaging/windows/package.ps1 -Arch x64
+      - name: Smoke test and prepare review artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = @(Get-ChildItem dist/release/*-windows-x64-portable.zip)
+          if ($zip.Count -ne 1) { throw 'Expected exactly one portable package' }
+          Expand-Archive $zip[0].FullName -DestinationPath vm-artifact
+          $bundle = @(Get-ChildItem vm-artifact -Directory)
+          if ($bundle.Count -ne 1) { throw 'Expected one portable directory' }
+          $exe = Join-Path $bundle[0].FullName 'artcraft-launcher.exe'
+          $process = Start-Process $exe -ArgumentList '--version' -PassThru -Wait -RedirectStandardOutput version.txt
+          if ($process.ExitCode -ne 0) { throw "Launcher smoke test failed: $($process.ExitCode)" }
+          $version = Get-Content version.txt -Raw
+          if ($version -notmatch 'artcraft-launcher|ArtCraft Launcher') { throw 'Missing launcher version output' }
+          Copy-Item docs/windows-vm-test.md (Join-Path $bundle[0].FullName 'VM-TEST.md')
+          @(
+            "Commit: $env:GITHUB_SHA"
+            "Run: https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            "Target: x86_64-pc-windows-msvc; release; static CRT; default features"
+            "Unsigned development launcher; official app MSI signature/checksum policy unchanged."
+            $version.Trim()
+          ) | Set-Content (Join-Path $bundle[0].FullName 'BUILD-INFO.txt')
+          Get-ChildItem $bundle[0].FullName -File | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
+          } | Set-Content (Join-Path $bundle[0].FullName 'SHA256SUMS.txt')
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: artcraft-launcher-windows-x64-vm-${{ github.sha }}
+          path: vm-artifact/
+          if-no-files-found: error
+          retention-days: 14
 
