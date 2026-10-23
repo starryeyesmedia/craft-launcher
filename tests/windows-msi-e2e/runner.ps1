@@ -11,6 +11,7 @@ if ($env:GITHUB_ACTIONS -cne 'true' -or $env:RUNNER_ENVIRONMENT -cne 'github-hos
     throw 'Refusing MSI test outside the manual disposable hosted workflow'
 }
 $null = New-Item -ItemType Directory -Force -Path $root
+$root = [IO.Path]::GetFullPath($root)
 $reportPath = Join-Path $root 'report.json'
 $diagnostics = Join-Path $root 'diagnostics'
 $null = New-Item -ItemType Directory -Force -Path $diagnostics
@@ -101,6 +102,7 @@ try {
                 publisher = $null; identityScope = 'not-run'; productCode = $null; error = $null
                 validationStage = 'published checksums'; metadata = $null
                 signerSubject = $null; signerIssuer = $null; signerThumbprint = $null
+                databaseStatus = $null; failureTypes = @()
             }
             $report.packages += $package
             Save-TestReport
@@ -124,19 +126,23 @@ try {
                     $package.signerThumbprint = $sig.SignerCertificate.Thumbprint
                 }
                 Assert-OfficialSignature $file
-                $package.validationStage = 'MSI identity and per-machine scope'
+                $package.validationStage = 'MSI database open'
                 $api = New-MsiApi
                 $msiArgs = [object[]]@($file, [IntPtr]::Zero, [uint32]0)
-                if ($api.GetMethod('MsiOpenDatabaseW').Invoke($null, $msiArgs) -ne 0) { throw 'Cannot read ProductCode' }
+                $package.databaseStatus = $api.GetMethod('MsiOpenDatabaseW').Invoke($null, $msiArgs)
+                if ($package.databaseStatus -ne 0) { throw 'Cannot open MSI database' }
                 try {
                     $metadata = [ordered]@{}
+                    $package.metadata = $metadata
                     foreach ($property in @('ProductCode','ProductName','Manufacturer','ProductVersion','ALLUSERS','MSIINSTALLPERUSER')) {
+                        $package.validationStage = "MSI property $property"
                         $metadata[$property] = Get-MsiProperty $api ([uint32]$msiArgs[2]) $property
                     }
                     $package.metadata = [pscustomobject]$metadata
                     $package.productCode = $metadata.ProductCode
                 }
                 finally { $null = $api.GetMethod('MsiCloseHandle').Invoke($null, [object[]]@([uint32]$msiArgs[2])) }
+                $package.validationStage = 'MSI identity and per-machine scope'
                 Assert-MsiIdentity $file ([pscustomobject]@{names=@($name)}) $version
                 $package.identityScope = 'passed: ALLUSERS=1; MSIINSTALLPERUSER absent/0; official name/manufacturer/version'
                 if ($package.productCode -cnotmatch '^\{[A-Fa-f0-9-]{36}\}$') { throw 'Invalid ProductCode' }
@@ -146,6 +152,11 @@ try {
                     -OutFile (Join-Path $root "$id-v$version.json") -UseBasicParsing -TimeoutSec 30 -UserAgent 'ArtCraft-Launcher/MSI-E2E'
             } catch {
                 $package.error = "Official package preflight failed: $($package.validationStage)"
+                $failure = $_.Exception
+                while ($null -ne $failure) {
+                    $package.failureTypes += "$($failure.GetType().FullName):$($failure.HResult)"
+                    $failure = $failure.InnerException
+                }
             } finally {
                 Save-TestReport
                 Write-Output "::notice title=Official MSI preflight::$asset checksum=$($package.checksum) signature=$($package.signature) publisher=$($package.publisher) stage=$($package.validationStage)"
@@ -244,7 +255,8 @@ try {
         foreach ($package in $report.packages) {
             # Public certificate and authored MSI properties; no paths, environment or credentials.
             $identity = [ordered]@{asset=$package.asset; subject=$package.signerSubject; issuer=$package.signerIssuer;
-                thumbprint=$package.signerThumbprint; metadata=$package.metadata; error=$package.error}
+                thumbprint=$package.signerThumbprint; metadata=$package.metadata; error=$package.error;
+                databaseStatus=$package.databaseStatus; failureTypes=$package.failureTypes}
             $identityJson = $identity | ConvertTo-Json -Depth 5 -Compress
             Write-Output "::notice title=Official MSI identity::$identityJson"
         }
