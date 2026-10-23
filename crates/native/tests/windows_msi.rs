@@ -137,7 +137,11 @@ $root=New-ProtectedRun $session
 try {
     if ((Assert-InstallDestination $root) -cne $root) { throw 'Protected destination was refused' }
     $file=[IO.Path]::Combine($root,'results')
-    [IO.File]::WriteAllText($file,"0 0" + [char]10)
+    $handle=New-ProtectedFile $file $true
+    try {
+        $bytes=[Text.Encoding]::UTF8.GetBytes("0 0" + [char]10)
+        $handle.Write($bytes,0,$bytes.Length)
+    } finally { $handle.Dispose() }
     foreach ($path in @($root,$file)) {
         $acl=Get-Acl -LiteralPath $path
         $owner=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value

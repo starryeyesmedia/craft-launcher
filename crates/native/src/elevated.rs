@@ -152,6 +152,18 @@ function New-ProtectedRun([string]$session) {
     return $root
 }
 
+function New-ProtectedFile([string]$path, [bool]$readable = $false) {
+    # Ownership does not inherit from a directory. Set it atomically at creation, rather than
+    # relying on the elevated account's default owner (which could be its unelevated user SID).
+    $acl = New-Object Security.AccessControl.FileSecurity
+    $sddl = 'O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)'
+    if ($readable) { $sddl += '(A;;0x120089;;;BU)' }
+    $acl.SetSecurityDescriptorSddlForm($sddl)
+    return [IO.FileStream]::new($path, [IO.FileMode]::CreateNew,
+        [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::Read,
+        4096, [IO.FileOptions]::None, $acl)
+}
+
 function Read-OfficialChecksums([string]$url) {
     for ($redirect = 0; $redirect -lt 6; $redirect++) {
         $uri = [Uri]$url
@@ -203,7 +215,7 @@ function New-MsiApi {
     # Reflection.Emit supplies managed P/Invoke declarations, without C# compilation or
     # writing/loading an assembly in a user-owned temporary directory.
     $assembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly(
-        [Reflection.AssemblyName]::new('ArtCraftMsi'), [Reflection.Emit.AssemblyBuilderAccess]::Run)
+        [Reflection.AssemblyName]::new('ArtCraftMsi' + [Guid]::NewGuid().ToString('N')), [Reflection.Emit.AssemblyBuilderAccess]::Run)
     $module = $assembly.DefineDynamicModule('ArtCraftMsi')
     $type = $module.DefineType('ArtCraftMsi', [Reflection.TypeAttributes]'Public, Abstract, Sealed')
     $dll = [IO.Path]::Combine([Environment]::SystemDirectory, 'msi.dll')
@@ -267,7 +279,8 @@ function Assert-MsiIdentity([string]$file, $app, [string]$version) {
 }
 
 function Assert-OfficialSignature([string]$file) {
-    $sig = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $file
+    try { $sig = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $file }
+    catch { throw 'Official Authenticode signature required' }
     if ($sig.Status -ne 'Valid' -or $null -eq $sig.SignerCertificate -or
         $sig.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -cne 'Learning Machines LLC') {
         throw 'Official Authenticode signature required'
@@ -318,7 +331,7 @@ function Copy-VerifiedPackage($item, $authorization, [string]$root, [int]$index,
             throw 'Invalid package stream'
         }
         $inputFile=$response.GetResponseStream()
-        $output = [IO.File]::Open($target, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $output = New-ProtectedFile $target
         try {
             $remaining=$response.ContentLength
             $buffer=New-Object byte[] 65536
@@ -355,7 +368,7 @@ function Invoke-ArtCraftBatch($request, $catalog) {
     if ($request.items.Count -lt 1 -or $request.items.Count -gt 64) { throw 'Invalid batch size' }
     if ($request.port -lt 1 -or $request.port -gt 65535) { throw 'Invalid local source port' }
     $root = New-ProtectedRun ([string]$request.session)
-    $results = [IO.File]::Open([IO.Path]::Combine($root, 'results'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    $results = New-ProtectedFile ([IO.Path]::Combine($root, 'results')) $true
     $writer = [IO.StreamWriter]::new($results, [Text.UTF8Encoding]::new($false))
     $writer.AutoFlush = $true
     try {
@@ -376,7 +389,10 @@ function Invoke-ArtCraftBatch($request, $catalog) {
                         $start.WorkingDirectory = [Environment]::SystemDirectory
                         $start.UseShellExecute = $false
                         # Logs live with the protected staged package; no user-writable log paths.
-                        $start.Arguments = '/i "' + $staged + '" /qn /norestart ALLUSERS=1 /l*v "' + [IO.Path]::Combine($root, "$i.log") + '"'
+                        $log = [IO.Path]::Combine($root, "$i.log")
+                        $logHandle = New-ProtectedFile $log
+                        $logHandle.Dispose()
+                        $start.Arguments = '/i "' + $staged + '" /qn /norestart ALLUSERS=1 /l*v "' + $log + '"'
                         if ($null -ne $item.destination) {
                             $destination = Assert-InstallDestination ([string]$item.destination)
                             # Always pass a trailing separator, doubled before the closing quote
@@ -488,8 +504,12 @@ pub fn install(items: &[Item], report: &mut dyn FnMut(usize, crate::msi_batch::R
         // Both paths/code are data, never interpolation of MSI/path strings into shell source.
         let host = powershell.to_str().ok_or("unusual Windows system path")?.replace('\'', "''");
         let cwd = system.to_str().ok_or("unusual Windows system path")?.replace('\'', "''");
+        let modules = powershell.parent().ok_or("unusual Windows system path")?.join("Modules");
+        let management = modules.join(r"Microsoft.PowerShell.Management\Microsoft.PowerShell.Management.psd1");
+        let management = management.to_str().ok_or("unusual Windows system path")?.replace('\'', "''");
         let outer = format!(
-            "$ErrorActionPreference='Stop'; try {{ $p = Start-Process -FilePath '{host}' -WorkingDirectory '{cwd}' \
+            "$ErrorActionPreference='Stop'; try {{ Import-Module '{management}'; \
+             $p = Microsoft.PowerShell.Management\\Start-Process -FilePath '{host}' -WorkingDirectory '{cwd}' \
              -ArgumentList '-NoProfile -NonInteractive -EncodedCommand {script}' -Verb RunAs -Wait -PassThru; exit $p.ExitCode \
              }} catch {{ $e=$_.Exception; while ($e) {{ if ($e.NativeErrorCode -eq 1223) {{ exit 1223 }}; $e=$e.InnerException }}; exit 1 }}"
         );
@@ -503,7 +523,7 @@ pub fn install(items: &[Item], report: &mut dyn FnMut(usize, crate::msi_batch::R
         if let Some(root) = system.parent() {
             command.env("SystemRoot", root).env("WINDIR", root);
         }
-        command.env("PATH", &system);
+        command.env("PATH", &system).env("PSModulePath", modules);
         command.args(["-NoProfile", "-NonInteractive", "-Command", &outer]);
         command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         Ok((command, results, source))

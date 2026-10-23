@@ -129,4 +129,52 @@ mod tests {
         drop(source);
         assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_policy_copies_loopback_bytes_but_rejects_unsigned_or_changed_packages() {
+        use base64::Engine as _;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("unsigned.msi");
+        std::fs::write(&path, b"unsigned MSI fixture").unwrap();
+        let sha = crate::http::sha256_file(&path).unwrap();
+        let item = crate::msi_batch::Item {
+            msi: path,
+            sha256: sha.clone(),
+            destination: None,
+            release: crate::elevated::ReleaseIdentity { app: "photocraft".into(), tag: "v0.5.0".into(), asset: "photo.msi".into() },
+        };
+        let mut random = [0; 16];
+        getrandom::fill(&mut random).unwrap();
+        let session = crate::http::hex(&random);
+        let source = Source::new(&[item.clone(), item], &session).unwrap();
+        let script = format!(
+            "{}\n$root=New-ProtectedRun '{session}'\n\
+             try {{\n\
+             $caught=$false; try {{ Copy-VerifiedPackage $null @{{sha='{sha}'}} $root 0 {} '{session}' }} \
+             catch {{ if ($_.Exception.Message -ne 'Official Authenticode signature required') {{ throw }}; $caught=$true }}\n\
+             if (-not $caught) {{ throw 'Unsigned stream was accepted' }}\n\
+             $caught=$false; try {{ Copy-VerifiedPackage $null @{{sha=('0'*64)}} $root 1 {} '{session}' }} \
+             catch {{ if ($_.Exception.Message -ne 'Changed package') {{ throw }}; $caught=$true }}\n\
+             if (-not $caught) {{ throw 'Changed stream was accepted' }}\n\
+             }} finally {{ [IO.Directory]::Delete($root,$true) }}",
+            crate::elevated::POLICY,
+            source.port,
+            source.port
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
+        let mut child = std::process::Command::new(crate::elevated::system_powershell().unwrap())
+            .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let command = format!(
+            "$ErrorActionPreference='Stop'; try {{ & ([ScriptBlock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{encoded}')))); exit 0 }} catch {{ [Console]::Error.WriteLine($_); exit 1 }}\n"
+        );
+        child.stdin.take().unwrap().write_all(command.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
 }

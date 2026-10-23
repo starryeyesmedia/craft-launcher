@@ -78,6 +78,10 @@ scope, and checks for running app processes immediately before each MSI.
 Each run uses a cryptographically random 128-bit session under the OS system directory, a parent
 standard users cannot write. The directory is created with a protected ACL: SYSTEM and
 Administrators get full control; Users get read/execute only; Administrators own the directory.
+Each staged MSI, log and result file also gets an explicit Administrators owner and protected
+ACL atomically at creation. Only the fixed-code results allow Users read access; verbose logs
+and staged packages remain administrator-only. Ownership does not inherit, and a default account SID owner could
+otherwise let the same account's unelevated processes change the file's ACL.
 Existing sessions and reparse paths are refused. Results are created once and held against
 writes/deletes while published incrementally. The parent reads this fixed, protected path,
 rather than trusting a child exit code or a path in its user-writable cache. A standard user
@@ -101,8 +105,12 @@ on development-branch pushes and relevant pull requests. It explicitly checks co
 runs strict clippy, and runs workspace unit/integration tests. Windows-native tests invoke
 the real system PowerShell, create/read MSI Property tables without installing them, test
 scope/identity/signature rejection, test deny-write/delete file sharing, inspect protected
-result ACLs and test session collision refusal. The ACL test requires an already elevated
-test shell (the hosted Windows runner supplies one); it does not request UAC.
+result ACLs and test session collision refusal. A separate test streams real cached bytes over
+the production loopback server into
+the protected staging directory and confirms rejection of unsigned and hash-mismatched data.
+The GUI integration test also checks that the obsolete helper exits with refusal status 2.
+The ACL and staging tests require an already elevated test shell (the hosted Windows runner
+supplies one); they do not request UAC.
 
 Unsigned GUI development builds can run these policy tests and can request installation of
 officially published/signed app releases. The GUI signature is no longer a trust input.
