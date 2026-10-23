@@ -55,11 +55,24 @@ file opens racing through caller-owned junctions into SMB paths and leaking admi
 network credentials. The elevated loopback client uses no proxy, credentials or redirects.
 The stream is length-capped and copied into an administrator-owned directory under
 the OS system directory. The policy hashes the copy against the official publication, verifies a valid
-Authenticode signature whose certificate simple name is Learning Machines LLC, and opens the
+Authenticode signature whose certificate simple name is exactly Learning Machines Inc, and opens the
 MSI database read-only through the absolute system msi.dll. Managed P/Invoke declarations are
 emitted in memory; privileged COM activation and user-owned temporary assemblies are avoided.
-It requires ProductName to match the catalog, Manufacturer to match the
-publisher, ProductVersion to match the release, ALLUSERS=1, and MSIINSTALLPERUSER absent or zero.
+It independently requires ProductName to match the catalog, Manufacturer to equal
+Learning Machines LLC, ProductVersion to match the release, ALLUSERS=1, and MSIINSTALLPERUSER
+absent or zero. The certificate signer and MSI Manufacturer are separate identities; neither
+is inferred from the other. There is no wildcard or legacy-publisher alias. Certificate subject,
+issuer and thumbprints for the four verified official packages are recorded in
+[the inspection evidence](windows-msi-identities.json), along with actual MSI properties and
+published hashes. The common signer subject is
+`CN=Learning Machines Inc,O=Learning Machines Inc,L=Atlanta,ST=Georgia,C=US`; its issuer is
+`CN=Microsoft ID Verified CS AOC CA 03,O=Microsoft Corporation,C=US` and SHA-1 certificate
+thumbprint is `0F52B93A635EFA09AF6036A4DD4977683B4FB7E2`.
+Thumbprints identify the inspected certificate, not a new trust anchor or a permanent pin:
+Microsoft's short-lived signing certificates rotate. Windows must still return `Valid`,
+including its certificate-chain and timestamp validation, for every package. No root or leaf
+certificates are imported. Linux extraction records certificate data and independently reads
+the MSI database; it does not replace the Windows trust decision.
 Only the staged, authenticated package goes to the system msiexec. A local source replacement
 or a hostile loopback peer cannot authorize different bytes: verification and installation use the
 protected copy. The staged file is read-locked against writes/deletion during checks and install.

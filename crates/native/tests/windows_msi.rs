@@ -33,6 +33,13 @@ function Must-Fail($work) {
     try { & $work } catch { $failed = $true }
     if (-not $failed) { throw 'Policy accepted invalid input' }
 }
+# This tests only the exact publisher-name filter, not certificate-chain success.
+# Real Authenticode success is exercised exclusively with official MSIs in the E2E workflow.
+Assert-AuthenticodePublisher 'Learning Machines Inc'
+foreach ($publisher in @('', 'Learning Machines LLC', 'Microsoft Corporation',
+    'learning machines inc', 'Learning Machines Inc ', 'Learning Machines Inc Evil', '*Learning Machines Inc*')) {
+    Must-Fail { Assert-AuthenticodePublisher $publisher }
+}
 Must-Fail { Assert-LocalPath '\\attacker\share\package.msi' }
 Must-Fail { Assert-LocalPath 'C:\x.msi:stream' }
 Must-Fail { Assert-LocalPath 'C:\x" ALLUSERS=2' }
@@ -89,6 +96,23 @@ try {
     Must-Fail { Assert-OfficialSignature $file }
     Must-Fail { Assert-MsiIdentity $file $app '0.6.0' }
     Must-Fail { Assert-MsiIdentity $file ([pscustomobject]@{names=@('FilmCraft')}) '0.5.0' }
+    # The authorized certificate publisher is NOT an authorized MSI Manufacturer.
+    $db=$installer.OpenDatabase($file, 1)
+    try {
+        $view=$db.OpenView("UPDATE Property SET Value='Learning Machines Inc' WHERE Property='Manufacturer'")
+        $view.Execute(); $view.Close()
+        $null=[Runtime.InteropServices.Marshal]::FinalReleaseComObject($view)
+        $db.Commit()
+    } finally { $null=[Runtime.InteropServices.Marshal]::FinalReleaseComObject($db) }
+    Must-Fail { Assert-MsiIdentity $file $app '0.5.0' }
+    $db=$installer.OpenDatabase($file, 1)
+    try {
+        $view=$db.OpenView("UPDATE Property SET Value='Learning Machines LLC' WHERE Property='Manufacturer'")
+        $view.Execute(); $view.Close()
+        $null=[Runtime.InteropServices.Marshal]::FinalReleaseComObject($view)
+        $db.Commit()
+    } finally { $null=[Runtime.InteropServices.Marshal]::FinalReleaseComObject($db) }
+    Assert-MsiIdentity $file $app '0.5.0'
     foreach ($scope in @('2', '')) {
         $db=$installer.OpenDatabase($file, 1)
         try {

@@ -14,7 +14,8 @@ helper executable, developer certificate, or Visual C++ redistributable is requi
 This is an **unsigned development launcher**, not a release. No signing secrets are used or
 production signing rules changed. The GUI remains unelevated. The system-hosted elevated
 policy still independently requires official published checksums, a valid Authenticode
-signature from Learning Machines LLC, and a per-machine MSI database. Do not disable UAC,
+signature from Learning Machines Inc, and a per-machine MSI database whose Manufacturer is
+Learning Machines LLC. These are separate requirements. Do not disable UAC,
 signature checks, antivirus, or certificate validation to make a test pass. If VM policy
 blocks the unsigned GUI, use a disposable VM whose policy permits unsigned development
 applications; do not weaken the official MSI policy or distribute the build as signed.
@@ -31,7 +32,7 @@ applications; do not weaken the official MSI policy or distribute the build as s
    (`vectorcraft-0.15.0-windows-x64.msi`). Newer releases existed when this recipe was written.
    Before running either MSI, compare `Get-FileHash <file> -Algorithm SHA256` with its exact
    published checksum entry. Run `Get-AuthenticodeSignature <file> | Format-List Status,SignerCertificate`:
-   require `Valid` and signer Learning Machines LLC. These release assets were identified
+   require `Valid` and signer Learning Machines Inc. These release assets were identified
    through official release metadata; their Windows signatures must be checked in the VM.
    Stop if either verification fails; do not re-sign or substitute an unsigned MSI.
 3. Install both older apps normally, accepting their individual setup prompts. Use their

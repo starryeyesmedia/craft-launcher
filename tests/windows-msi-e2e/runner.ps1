@@ -182,14 +182,22 @@ try {
         if (Test-Path (Join-Path $root 'negative.json')) { $report.negative = @(Get-Content (Join-Path $root 'negative.json') -Raw | ConvertFrom-Json) }
         if (Test-Path (Join-Path $root 'sessions.json')) {
             $sessions = @(Get-Content (Join-Path $root 'sessions.json') -Raw | ConvertFrom-Json)
-            foreach ($session in $sessions) {
+            foreach ($record in $sessions) {
+                $session = [string]$record.id
                 if ($session -cnotmatch '^[a-f0-9]{32}$') { throw 'Invalid diagnostic session' }
                 $run = [IO.Path]::Combine([Environment]::SystemDirectory, "ArtCraft-MSI-$session")
                 $results = [IO.Path]::Combine($run, 'results')
                 if (Test-Path $results) {
                     $codes = @(Get-Content $results | Where-Object { $_ -cmatch '^\d+ (\d+|rejected|running)$' })
-                    $report.protectedResults += [pscustomobject]@{session=$session; results=$codes}
-                    Get-ChildItem $run -Filter '*.log' | Copy-Item -Destination $root
+                    $perApp = @(foreach ($line in $codes) {
+                        $index, $code = $line -split ' '
+                        if ([int]$index -ge @($record.apps).Count) { throw 'Invalid result index' }
+                        [pscustomobject]@{app=$record.apps[[int]$index]; code=$code}
+                    })
+                    $report.protectedResults += [pscustomobject]@{session=$session; results=$codes; perApp=$perApp}
+                    foreach ($log in Get-ChildItem $run -Filter '*.log') {
+                        Copy-Item $log.FullName (Join-Path $root "$session-$($log.Name)")
+                    }
                 }
             }
         }
@@ -233,6 +241,13 @@ try {
             baselineExits=$report.baselineExits; protectedResults=$report.protectedResults}
         $summary = $brief | ConvertTo-Json -Depth 8 -Compress
         Write-Output "::notice title=Windows MSI E2E results::$summary"
+        foreach ($package in $report.packages) {
+            # Public certificate and authored MSI properties; no paths, environment or credentials.
+            $identity = [ordered]@{asset=$package.asset; subject=$package.signerSubject; issuer=$package.signerIssuer;
+                thumbprint=$package.signerThumbprint; metadata=$package.metadata; error=$package.error}
+            $identityJson = $identity | ConvertTo-Json -Depth 5 -Compress
+            Write-Output "::notice title=Official MSI identity::$identityJson"
+        }
         if ($env:GITHUB_STEP_SUMMARY) { $report | ConvertTo-Json -Depth 12 | Add-Content $env:GITHUB_STEP_SUMMARY }
     }
 }

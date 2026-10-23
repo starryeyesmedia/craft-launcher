@@ -124,7 +124,7 @@ fn batch(root: &Path) -> Result<(), String> {
     if sessions.len() != 2 {
         return Err("expected one successful batch and one negative-case batch".into());
     }
-    let negative_session = sessions.last().ok_or("missing negative-case session")?;
+    let negative_session = &sessions.last().ok_or("missing negative-case session")?.id;
     let system = winsafe::GetSystemDirectory().map_err(|e| e.to_string())?;
     let text =
         std::fs::read_to_string(Path::new(&system).join(format!("ArtCraft-MSI-{negative_session}")).join("results")).map_err(|e| e.to_string())?;

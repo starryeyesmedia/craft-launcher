@@ -278,13 +278,19 @@ function Assert-MsiIdentity([string]$file, $app, [string]$version) {
     } finally { $null = $api.GetMethod('MsiCloseHandle').Invoke($null, [object[]]@($db)) }
 }
 
+function Assert-AuthenticodePublisher([string]$publisher) {
+    # Signing identity is independent of the authored MSI Manufacturer (Learning Machines LLC).
+    # Exact identity, not an alias/prefix/wildcard. Windows validates the certificate chain first.
+    if ($publisher -cne 'Learning Machines Inc') { throw 'Official Authenticode publisher required' }
+}
+
 function Assert-OfficialSignature([string]$file) {
     try { $sig = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $file }
     catch { throw 'Official Authenticode signature required' }
-    if ($sig.Status -ne 'Valid' -or $null -eq $sig.SignerCertificate -or
-        $sig.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -cne 'Learning Machines LLC') {
+    if ($sig.Status -ne 'Valid' -or $null -eq $sig.SignerCertificate) {
         throw 'Official Authenticode signature required'
     }
+    Assert-AuthenticodePublisher ($sig.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false))
 }
 
 function Get-ReleaseAuthorization($item, $catalog) {
@@ -531,7 +537,10 @@ pub fn install(items: &[Item], report: &mut dyn FnMut(usize, crate::msi_batch::R
             // Only the ignored disposable-runner unit test can select this path. The identical
             // encoded policy runs in the runner's EXISTING admin token; no UAC claim is made.
             command.args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &script]);
-            hosted_test::SESSIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(session);
+            hosted_test::SESSIONS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(hosted_test::Session { id: session, apps: items.iter().map(|item| item.release.app.clone()).collect() });
         } else {
             command.args(["-NoProfile", "-NonInteractive", "-Command", &outer]);
         }
@@ -585,8 +594,13 @@ pub fn install(items: &[Item], report: &mut dyn FnMut(usize, crate::msi_batch::R
 
 #[cfg(all(test, windows))]
 pub(crate) mod hosted_test {
+    #[derive(Clone, serde::Serialize)]
+    pub struct Session {
+        pub id: String,
+        pub apps: Vec<String>,
+    }
     pub static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    pub static SESSIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    pub static SESSIONS: std::sync::Mutex<Vec<Session>> = std::sync::Mutex::new(Vec::new());
 }
 
 /// Results never pass through a user-owned cache path. Bound reads even if another administrator

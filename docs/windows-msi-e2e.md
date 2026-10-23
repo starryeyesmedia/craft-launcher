@@ -60,19 +60,23 @@ per-machine metadata, the workflow fails clearly during preflight. Do not change
 verification to obtain a green integration run. Such incompatibility is a release prerequisite
 to resolve with the official publisher.
 
-## Observed release incompatibility
+## Verified signing and manufacturer identities
 
-The October 23, 2026 automated run verified the published hashes for all four requested MSIs
-and Windows reported `Valid` Authenticode signatures, but the certificate simple name is
-**Learning Machines Inc**. The current production policy and requested test authorization
-require **Learning Machines LLC**. Preflight therefore rejects all four packages before
-installing anything. This is a failed integration prerequisite, not successful update testing.
+The initial October 23, 2026 run exposed an incorrect assumption: the certificate publisher
+is **Learning Machines Inc**, while the authored MSI Manufacturer is **Learning Machines LLC**.
+All four official packages were downloaded again and independently inspected with `msiinfo`
+and Authenticode CMS extraction. [The recorded evidence](windows-msi-identities.json) includes
+the full certificate subject, issuer, thumbprint, each published SHA-256 and actual MSI table
+values. All four specify `ALLUSERS=1` and omit `MSIINSTALLPERUSER`; ProductName and ProductVersion
+match the requested applications/releases. Source templates were not used as a substitute
+for inspecting the actual MSI databases.
 
-The tagged PhotoCraft 0.14.0 and VectorCraft 0.16.0 WiX sources declare
-`Manufacturer="Learning Machines LLC"` and `Scope="perMachine"`. MSI manufacturer metadata and
-the Authenticode certificate publisher are distinct identities; matching the manufacturer
-does not authorize a different signer. Reconciling the authorized signing identity requires
-an explicit security-policy decision. This test does not add a publisher alias, trust a new
-certificate, or bypass the rejection. Public certificate subject/issuer/thumbprint are included
-in the diagnostic report to support that review. MSI database scope checks and actual
-installations remain unexecuted when signature publisher verification fails.
+The production signer check now accepts exactly **Learning Machines Inc**, after Windows
+reports a `Valid` Authenticode signature. The independent Manufacturer check remains exactly
+**Learning Machines LLC**. No publisher alias, wildcard, certificate-chain bypass, trust-store
+change or per-machine scope relaxation was introduced. The unit tests distinguish these two
+identities; the E2E must additionally validate the real packages and actual installations.
+Public certificate details and read-only MSI properties are also captured on the Windows
+runner. Protected-policy result indices are mapped to app IDs in test-only instrumentation,
+so per-app MSI exit codes remain attributable even when concurrent downloads finish in a
+different order.
