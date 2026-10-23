@@ -316,6 +316,13 @@ impl NativeBackend {
     }
 
     fn start_job(&self, app_id: &str, work: Work) {
+        #[cfg(windows)]
+        self.start_job_with_slot(app_id, work, None);
+        #[cfg(not(windows))]
+        self.start_job_with_slot(app_id, work);
+    }
+
+    fn start_job_with_slot(&self, app_id: &str, work: Work, #[cfg(windows)] batch_slot: BatchSlot) {
         let uninstall = work == Work::Uninstall;
         let Some(app) = CraftApp::by_id(app_id) else { return };
         log::info!("{}: starting {} job", app.name, if uninstall { "uninstall" } else { "install/update" });
@@ -369,6 +376,8 @@ impl NativeBackend {
                     record.as_ref(),
                     &stop,
                     work == Work::Replace,
+                    #[cfg(windows)]
+                    batch_slot,
                 );
                 // Stopped by the connection rather than by the user: say so, and how to go on.
                 match r {
@@ -467,6 +476,9 @@ enum Work {
     Uninstall,
 }
 
+#[cfg(windows)]
+type BatchSlot = Option<crate::msi_batch::Slot<'static>>;
+
 #[allow(clippy::too_many_arguments)]
 fn run_install(
     app: &CraftApp,
@@ -479,6 +491,7 @@ fn run_install(
     record: Option<&crate::manifest::Record>,
     stop: &Stop,
     replace: bool,
+    #[cfg(windows)] batch_slot: BatchSlot,
 ) -> Result<String, String> {
     if let Some(msg) = existing.and_then(|e| install::managed_elsewhere(app, e, false)) {
         return Err(msg);
@@ -516,7 +529,16 @@ fn run_install(
         last_emit = Instant::now();
         shared.emit(Event::Progress { app: app.id.to_string(), phase: p });
     };
-    let mut job = Job { http, paths, stop, phase: &mut phase, install_locations: &options.install_locations, replace };
+    let mut job = Job {
+        http,
+        paths,
+        stop,
+        phase: &mut phase,
+        install_locations: &options.install_locations,
+        replace,
+        #[cfg(windows)]
+        msi_batch: batch_slot,
+    };
     let mut commit_record = |record: &crate::manifest::Record| {
         let mut manifest = shared.manifest.lock().unwrap_or_else(PoisonError::into_inner);
         let mut updated = manifest.clone();
@@ -967,6 +989,20 @@ impl Backend for NativeBackend {
             Command::CheckForUpdates { force } => self.check(force),
             Command::Detect => self.detect_all(),
             Command::Install { app } => self.start_job(&app, Work::Install),
+            Command::InstallAll { apps } => {
+                #[cfg(windows)]
+                {
+                    let grouped = crate::msi_batch::BATCH.begin(apps.len());
+                    for app in apps {
+                        let slot = grouped.then(|| crate::msi_batch::BATCH.slot());
+                        self.start_job_with_slot(&app, Work::Install, slot);
+                    }
+                }
+                #[cfg(not(windows))]
+                for app in apps {
+                    self.start_job(&app, Work::Install);
+                }
+            }
             Command::Replace { app } => self.start_job(&app, Work::Replace),
             Command::Uninstall { app } => self.start_job(&app, Work::Uninstall),
             Command::Pause { app } => {

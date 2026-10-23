@@ -514,9 +514,9 @@ fn grid_shows_every_status_and_installs_on_click() {
     h.get_by_label_contains("48 MB of 131 MB");
     h.get_by_label("Update all (2)").click();
     h.run_steps(2);
-    let installs: Vec<_> = sent.borrow().iter().filter_map(|c| if let Command::Install { app } = c { Some(app.clone()) } else { None }).collect();
-    assert_eq!(installs.len(), 2, "{installs:?}");
-    assert!(installs.contains(&"photocraft".to_string()) && installs.contains(&"effectcraft".to_string()));
+    let installs =
+        sent.borrow().iter().find_map(|c| if let Command::InstallAll { apps } = c { Some(apps.clone()) } else { None }).unwrap_or_default();
+    assert_eq!(installs, ["photocraft", "effectcraft"]);
 }
 
 #[test]

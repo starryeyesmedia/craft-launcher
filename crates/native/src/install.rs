@@ -39,6 +39,15 @@ pub struct Job<'a> {
     pub install_locations: &'a InstallLocations,
     /// Write over whatever [`occupied`] found.
     pub replace: bool,
+    #[cfg(windows)]
+    pub(crate) msi_batch: Option<crate::msi_batch::Slot<'static>>,
+}
+
+/// A downloaded file and the release checksum that authorized it.
+pub(crate) struct Downloaded {
+    pub path: PathBuf,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub sha256: String,
 }
 
 /// Downloads and installs `asset` of `release`. Returns a record when the launcher owns the
@@ -90,8 +99,20 @@ pub fn install_at(
         return Err(format!("Cannot update {} to {}: installed version {} is newer", app.name, release.version_label(), inst_v));
     }
     log::info!("{}: starting {} to {} ({})", app.name, if existing.is_some() { "update" } else { "install" }, release.version_label(), kind.label());
-    let file = download(release, asset, job)?;
+    #[cfg(windows)]
+    let msi_ticket =
+        (kind == PackageKind::Msi).then(|| job.msi_batch.take().map_or_else(|| crate::msi_batch::BATCH.join(), crate::msi_batch::Slot::join));
+    let downloaded = download(release, asset, job)?;
+    let file = downloaded.path;
     log::info!("{}: download ready ({}), running installer...", app.name, file.display());
+    // An app can be opened while its update is downloading. Check again immediately before an
+    // MSI enters the batch, so a quiet elevated install never knowingly replaces a running app.
+    if let Some(inst) = existing
+        && inst.source.launcher_can_update()
+        && process::is_running(Path::new(&inst.location))
+    {
+        return Err(format!("{} is running. Quit it, then try again.", app.name));
+    }
     // Past this point the install can't be interrupted halfway.
     (job.phase)(JobPhase::Installing);
     #[allow(unused_variables)]
@@ -103,7 +124,15 @@ pub fn install_at(
                 .map(|path| Some(record(&version, kind, path, Vec::new(), false)))
         }
         #[cfg(windows)]
-        PackageKind::Msi => windows::run_msi(&file, destination.as_deref(), job.stop, &mut *job.phase).map(|_| None),
+        PackageKind::Msi => {
+            let item = crate::msi_batch::Item { msi: file.clone(), sha256: downloaded.sha256.clone(), destination: destination.clone() };
+            let ticket = msi_ticket.ok_or("the Windows MSI batch wasn't prepared")?;
+            ticket
+                .install(item, &cancelled(job.stop), &mut *job.phase, &|items, reports| {
+                    crate::elevated::install(items, job.paths, reports);
+                })
+                .map(|_| None)
+        }
         #[cfg(windows)]
         PackageKind::PortableZip => {
             crate::portable::install(app, &file, &version, previous, job.paths, destination.as_deref(), job.replace, &mut |record| {
@@ -266,7 +295,7 @@ fn selected_folder(folder: &str, writable: bool) -> Result<PathBuf, String> {
 }
 
 #[cfg(any(windows, test))]
-fn msi_folder_argument(path: &Path) -> Result<String, String> {
+pub(crate) fn msi_folder_argument(path: &Path) -> Result<String, String> {
     let value = path.to_str().ok_or("unusual characters in a path")?;
     if value.chars().any(|c| c == '"' || c.is_control()) {
         return Err(format!("couldn't use install folder {value}: the path contains invalid characters"));
@@ -365,7 +394,7 @@ pub fn available_kinds() -> Vec<PackageKind> {
 /// Fetches `asset` into the download folder, checked against its published SHA-256: the feed's
 /// or GitHub's per-file digest, else the release's `SHA256SUMS.txt`. A release with neither is
 /// refused before anything is fetched: a file nothing vouches for is never installed (#90).
-pub(crate) fn download(release: &Release, asset: &Asset, job: &mut Job<'_>) -> Result<PathBuf, String> {
+pub(crate) fn download(release: &Release, asset: &Asset, job: &mut Job<'_>) -> Result<Downloaded, String> {
     if !release::valid_file_name(&asset.name) {
         return Err("the release has an unexpected file name".into());
     }
@@ -379,6 +408,7 @@ pub(crate) fn download(release: &Release, asset: &Asset, job: &mut Job<'_>) -> R
             asset.name
         ));
     };
+    let sha = sha.to_ascii_lowercase();
     let dest = download_path(job.paths, asset);
     let phase = &mut *job.phase;
     job.http.download(&asset.url, &dest, asset.size, &sha, job.stop, &mut |t| match t {
@@ -386,7 +416,7 @@ pub(crate) fn download(release: &Release, asset: &Asset, job: &mut Job<'_>) -> R
         Transfer::Reconnecting { done, total } => phase(JobPhase::Reconnecting { done, total }),
     })?;
     (job.phase)(JobPhase::Verifying);
-    Ok(dest)
+    Ok(Downloaded { path: dest, sha256: sha })
 }
 
 /// The file's line in the release's `SHA256SUMS.txt`. `Ok(None)` only when the release really
@@ -1898,6 +1928,8 @@ mod tests {
                 phase: &mut phase,
                 install_locations: &InstallLocations::default(),
                 replace: false,
+                #[cfg(windows)]
+                msi_batch: None,
             };
             let err = install(app, &release, &asset, kind, None, None, &mut job).unwrap_err();
             assert!(err.contains("isn't supported"), "{err}");
@@ -1922,7 +1954,16 @@ mod tests {
         let http = Http::new().unwrap();
         let mut phases = vec![];
         let mut phase = |p| phases.push(p);
-        let mut job = Job { http: &http, paths: &paths, stop: &Stop::default(), phase: &mut phase, install_locations: &locations, replace: false };
+        let mut job = Job {
+            http: &http,
+            paths: &paths,
+            stop: &Stop::default(),
+            phase: &mut phase,
+            install_locations: &locations,
+            replace: false,
+            #[cfg(windows)]
+            msi_batch: None,
+        };
         let error = install(app, &release, &asset, PackageKind::AppImage, None, None, &mut job).unwrap_err();
         assert!(error.contains("folder is unavailable") || (process::in_sandbox() && error.contains("aren't supported")), "{error}");
         assert!(requests.lock().unwrap().is_empty());
@@ -1952,6 +1993,8 @@ mod tests {
             phase: &mut phase,
             install_locations: &InstallLocations::default(),
             replace: false,
+            #[cfg(windows)]
+            msi_batch: None,
         };
         let err = install(app, &release, &asset, kind, None, None, &mut job).unwrap_err();
         assert!(err.contains("publishes no checksum"), "{err}");
@@ -2371,7 +2414,16 @@ mod tests {
             package: None,
         };
         let stop = Stop::default();
-        let mut job = Job { http: &http, paths: &paths, stop: &stop, phase, install_locations: &locations, replace: false };
+        let mut job = Job {
+            http: &http,
+            paths: &paths,
+            stop: &stop,
+            phase,
+            install_locations: &locations,
+            replace: false,
+            #[cfg(windows)]
+            msi_batch: None,
+        };
         let result = install_at(app, &release, &asset, PackageKind::AppImage, Some(&installed), None, &mut job, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("installed version 0.5.0 is newer"));
@@ -2394,7 +2446,16 @@ mod tests {
             ..Asset::default()
         };
         let stop = Stop::default();
-        let mut job = Job { http: &http, paths: &paths, stop: &stop, phase, install_locations: &locations, replace: false };
+        let mut job = Job {
+            http: &http,
+            paths: &paths,
+            stop: &stop,
+            phase,
+            install_locations: &locations,
+            replace: false,
+            #[cfg(windows)]
+            msi_batch: None,
+        };
         let result = install_at(app, &release, &asset, PackageKind::AppImage, None, None, &mut job, None);
         assert!(result.is_err(), "mismatched artifact version must be rejected");
         assert!(result.unwrap_err().contains("does not match the advertised version"));

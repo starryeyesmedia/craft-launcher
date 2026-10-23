@@ -226,8 +226,18 @@ pub fn update(
     let (asset, _) = pick_asset(release, &[LAUNCHER.id], platform, &[install.kind()])
         .ok_or_else(|| format!("ArtCraft Launcher {} has no {} for {}", release.version_label(), install.kind().label(), platform.label()))?;
     let asset = asset.clone();
-    let mut job = Job { http, paths, stop, phase, install_locations: &Default::default(), replace: false };
-    let file = install::download(release, &asset, &mut job)?;
+    let mut job = Job {
+        http,
+        paths,
+        stop,
+        phase,
+        install_locations: &Default::default(),
+        replace: false,
+        #[cfg(windows)]
+        msi_batch: None,
+    };
+    let downloaded = install::download(release, &asset, &mut job)?;
+    let file = downloaded.path;
     #[cfg(windows)]
     windows_precheck(install, paths, &file)?;
     // The restart ends this process: nothing else may be under way.
@@ -567,7 +577,7 @@ fn same_cache_as_helper(paths: &Paths, exe: &Path) -> Result<(), String> {
 /// `reference`, this program. Refuses an unsigned file, another publisher's, and every file when
 /// `reference` itself isn't signed.
 #[cfg(windows)]
-fn signed_like(reference: &Path, file: &Path) -> Result<(), String> {
+pub(crate) fn signed_like(reference: &Path, file: &Path) -> Result<(), String> {
     let publisher = |path: &Path| verifysign::verify_file(path).map(|signature| signature.subject_name());
     let ours = publisher(reference).map_err(|e| format!("this copy of ArtCraft Launcher isn't signed ({e}), so it doesn't install updates"))?;
     let theirs = publisher(file).map_err(|e| format!("{} isn't signed ({e})", file.display()))?;

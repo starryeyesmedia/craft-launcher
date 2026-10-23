@@ -25,6 +25,11 @@ pub enum Command {
     Install {
         app: String,
     },
+    /// Install every eligible app in one user action. Windows groups its MSI installers behind
+    /// one UAC approval; other platforms keep their normal per-app installers.
+    InstallAll {
+        apps: Vec<String>,
+    },
     /// `Install`, writing over what [`Event::Occupied`] reported.
     Replace {
         app: String,
@@ -109,6 +114,8 @@ pub enum JobPhase {
     Verifying,
     /// The system's installer is busy with another app; this one goes next.
     Waiting,
+    /// Waiting for the one UAC approval that covers this MSI batch.
+    Permission,
     /// Waiting on the OS installer (MSI) or copying files.
     Installing,
     Removing,

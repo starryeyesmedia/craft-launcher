@@ -37,10 +37,16 @@ fn main() -> ExitCode {
     // First, so the panic report and every start-up warning are recorded (`logging`).
     let logs = logging::install();
     logging::install_panic_hook();
-    // A copy of the launcher finishing a self-update: no window, log file or single-instance claim.
     #[cfg(windows)]
-    if let Some(done) = artcraft_launcher_native::self_update::finish(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
-        return if done.is_ok() { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+    {
+        let args: Vec<_> = std::env::args_os().skip(1).collect();
+        if args.first().is_some_and(|arg| arg == artcraft_launcher_native::elevated::FLAG) {
+            return ExitCode::from(artcraft_launcher_native::elevated::helper_main(&args[1..]));
+        }
+        // A copy of the launcher finishing a self-update: no window, log file or single-instance claim.
+        if let Some(done) = artcraft_launcher_native::self_update::finish(&args) {
+            return if done.is_ok() { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+        }
     }
     // Detect system language in the background so the first frame can use it.
     artcraft_launcher_ui_egui::i18n::detect_system_lang_in_background();
