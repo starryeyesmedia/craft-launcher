@@ -1090,6 +1090,9 @@ impl Backend for NativeBackend {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    mod windows_e2e;
+
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
 

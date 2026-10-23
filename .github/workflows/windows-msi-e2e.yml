@@ -1,0 +1,49 @@
+name: Windows real MSI batch integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-real-msi-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  official-msi-updates:
+    if: github.repository == 'starryeyesmedia/craft-launcher' && github.ref == 'refs/heads/fix/windows-batched-uac'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Initialize disposable test directory
+        shell: pwsh
+        run: '"ARTCRAFT_MSI_E2E_ROOT=$env:RUNNER_TEMP/artcraft-msi-e2e" | Add-Content $env:GITHUB_ENV'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Windows MSVC Clippy
+        run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
+      - name: Windows MSVC tests (destructive test remains ignored)
+        run: cargo test --workspace --locked --target x86_64-pc-windows-msvc
+      - name: Install old official apps and update through real InstallAll
+        run: >-
+          cargo test -p artcraft-launcher-native --lib --locked --target x86_64-pc-windows-msvc
+          backend::tests::windows_e2e::official_msi_batch_e2e -- --ignored --exact --nocapture --test-threads=1
+      - name: Collect sanitized evidence and remove test installations
+        if: always()
+        shell: pwsh
+        run: |
+          $phase = 'finish'
+          & ./tests/windows-msi-e2e/runner.ps1
+      - name: Upload sanitized diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-real-msi-report-${{ github.sha }}
+          path: ${{ runner.temp }}/artcraft-msi-e2e/diagnostics/
+          if-no-files-found: error
+          retention-days: 14

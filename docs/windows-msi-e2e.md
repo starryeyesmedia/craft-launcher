@@ -1,0 +1,51 @@
+# Real Windows MSI integration
+
+The **Windows real MSI batch integration** workflow is manual only, restricted to
+`starryeyesmedia/craft-launcher`, `fix/windows-batched-uac`, and a disposable GitHub-hosted
+`windows-latest` runner. No secrets, certificates, trust-store changes, or local mirrors are
+used. Never run its ignored test against a workstation or persistent/self-hosted runner.
+
+The ignored Windows unit test `backend::tests::windows_e2e::official_msi_batch_e2e`:
+
+1. Refuses existing PhotoCraft/VectorCraft installations. Downloads official x64 MSIs and
+   checksum files for PhotoCraft 0.13.0/0.14.0 and VectorCraft 0.15.0/0.16.0. Uses the production
+   policy's checksum parser, Authenticode publisher validation, read-only MSI identity and
+   per-machine scope checks. **All four packages must pass before any installation starts.**
+2. Installs the older verified packages with the system MSI engine and their normal
+   per-machine defaults. Checks HKLM 64-bit uninstall records, exact versions/publisher and
+   WindowsInstaller registration. Does not use `Win32_Product`, which can trigger repairs.
+3. Seeds the backend with the actual pinned GitHub release metadata and detected baseline
+   installations, then sends the real `Command::InstallAll`. Backend workers download and
+   verify the official update packages again, reserve/join the real shared MSI coordinator,
+   and invoke the unchanged protected policy and local byte source. The test requires one
+   policy invocation for both apps and individual successful backend results.
+4. Requires the exact new versions in machine-wide installation records. Exercises real
+   protected-policy rejection of a forged caller checksum and corrupted official MSI bytes,
+   with two individual errors; rechecks installed versions afterwards.
+
+The runner already has an administrator token. Only in a `cfg(test)` build, an internal flag
+set by this ignored test selects direct system PowerShell execution of the **identical encoded
+policy**, instead of the production `Start-Process -Verb RunAs` wrapper. The flag and branch
+are absent from shipped binaries. The compiled catalog, independently fetched published
+checksums, Authenticode, identity/scope checks, protected ACLs, staging, results, and real
+`msiexec` execution are retained. No successful signature verification is mocked.
+
+**Automated installation success is not verification of one interactive UAC approval.** The
+hosted test cannot verify consent count, secure desktop behavior, credential entry,
+cancellation of UAC, or the unelevated/admin boundary. GUI/running-app end-to-end behavior
+also remains a [disposable VM task](windows-vm-test.md); unit tests separately cover the
+coordinator's cancellation and installer serialization.
+
+The always-run finalizer captures verification states, before/after records, per-app backend
+results, protected policy result codes, baseline/cleanup MSI exit codes, Windows version,
+and unavailable scenarios. It removes only verified test ProductCodes on the initially empty
+runner; GitHub discards the VM afterwards. A failure before installation never enables
+cleanup. Raw MSI logs, package files, and GitHub API answers stay private to the disposable
+runner. The diagnostic artifact contains JSON and **allowlisted numeric MSI returns/action
+identifiers only**, excluding raw property/environment dumps, credentials and personal paths.
+An annotation and job summary expose decisive results when artifact downloads are unavailable.
+
+If upstream releases lack a valid official signature, published checksum or compatible
+per-machine metadata, the workflow fails clearly during preflight. Do not change production
+verification to obtain a green integration run. Such incompatibility is a release prerequisite
+to resolve with the official publisher.

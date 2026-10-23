@@ -524,7 +524,17 @@ pub fn install(items: &[Item], report: &mut dyn FnMut(usize, crate::msi_batch::R
             command.env("SystemRoot", root).env("WINDIR", root);
         }
         command.env("PATH", &system).env("PSModulePath", modules);
+        #[cfg(not(test))]
         command.args(["-NoProfile", "-NonInteractive", "-Command", &outer]);
+        #[cfg(test)]
+        if hosted_test::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+            // Only the ignored disposable-runner unit test can select this path. The identical
+            // encoded policy runs in the runner's EXISTING admin token; no UAC claim is made.
+            command.args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &script]);
+            hosted_test::SESSIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(session);
+        } else {
+            command.args(["-NoProfile", "-NonInteractive", "-Command", &outer]);
+        }
         command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         Ok((command, results, source))
     })();
@@ -571,6 +581,12 @@ pub fn install(items: &[Item], report: &mut dyn FnMut(usize, crate::msi_batch::R
         };
         report(i, Report::Done(Err(error)));
     }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) mod hosted_test {
+    pub static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    pub static SESSIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 }
 
 /// Results never pass through a user-owned cache path. Bound reads even if another administrator
