@@ -47,7 +47,13 @@ function Save-TestReport {
     # Keep completed verification evidence even if a later download or process is interrupted.
     $temp = Join-Path $root ([IO.Path]::GetRandomFileName())
     [IO.File]::WriteAllText($temp, ($report | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
-    if ([IO.File]::Exists($reportPath)) { [IO.File]::Replace($temp, $reportPath, $null) }
+    if ([IO.File]::Exists($reportPath)) {
+        # PowerShell coerces $null to an empty string for this .NET string parameter.
+        $backup = Join-Path $root 'report.previous.json'
+        [IO.File]::Delete($backup)
+        [IO.File]::Replace($temp, $reportPath, $backup)
+        [IO.File]::Delete($backup)
+    }
     else { [IO.File]::Move($temp, $reportPath) }
 }
 
