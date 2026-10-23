@@ -5,6 +5,16 @@ The **Windows real MSI batch integration** workflow is manual only, restricted t
 `windows-latest` runner. No secrets, certificates, trust-store changes, or local mirrors are
 used. Never run its ignored test against a workstation or persistent/self-hosted runner.
 
+Until this workflow exists on the default branch, GitHub cannot dispatch it directly by name.
+Dispatch the existing **Windows MSI security** workflow on `fix/windows-batched-uac` with
+`real_msi_e2e=true` (`package_vm=false`). Its explicitly manual-only job calls this dedicated
+workflow. Push and pull-request runs cannot select that job. For example:
+
+```sh
+gh workflow run windows-msi.yml --repo starryeyesmedia/craft-launcher \
+  --ref fix/windows-batched-uac -f real_msi_e2e=true
+```
+
 The ignored Windows unit test `backend::tests::windows_e2e::official_msi_batch_e2e`:
 
 1. Refuses existing PhotoCraft/VectorCraft installations. Downloads official x64 MSIs and

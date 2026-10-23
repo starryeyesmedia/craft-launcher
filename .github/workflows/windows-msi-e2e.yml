@@ -2,6 +2,9 @@ name: Windows real MSI batch integration
 
 on:
   workflow_dispatch:
+  # The existing registered workflow exposes a manual-only launcher for this branch-local
+  # workflow, so testing does not require adding it to main just to register its dispatch.
+  workflow_call:
 
 permissions:
   contents: read

@@ -15,6 +15,10 @@ on:
         description: Build and upload an unsigned x64 portable launcher for VM testing
         type: boolean
         default: false
+      real_msi_e2e:
+        description: Install and update official apps on a disposable Windows runner
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -24,6 +28,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  real-msi-integration:
+    if: github.event_name == 'workflow_dispatch' && inputs.real_msi_e2e && github.ref == 'refs/heads/fix/windows-batched-uac'
+    uses: ./.github/workflows/windows-msi-e2e.yml
+
   windows-msvc:
     runs-on: windows-latest
     steps:
