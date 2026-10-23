@@ -59,3 +59,20 @@ If upstream releases lack a valid official signature, published checksum or comp
 per-machine metadata, the workflow fails clearly during preflight. Do not change production
 verification to obtain a green integration run. Such incompatibility is a release prerequisite
 to resolve with the official publisher.
+
+## Observed release incompatibility
+
+The October 23, 2026 automated run verified the published hashes for all four requested MSIs
+and Windows reported `Valid` Authenticode signatures, but the certificate simple name is
+**Learning Machines Inc**. The current production policy and requested test authorization
+require **Learning Machines LLC**. Preflight therefore rejects all four packages before
+installing anything. This is a failed integration prerequisite, not successful update testing.
+
+The tagged PhotoCraft 0.14.0 and VectorCraft 0.16.0 WiX sources declare
+`Manufacturer="Learning Machines LLC"` and `Scope="perMachine"`. MSI manufacturer metadata and
+the Authenticode certificate publisher are distinct identities; matching the manufacturer
+does not authorize a different signer. Reconciling the authorized signing identity requires
+an explicit security-policy decision. This test does not add a publisher alias, trust a new
+certificate, or bypass the rejection. Public certificate subject/issuer/thumbprint are included
+in the diagnostic report to support that review. MSI database scope checks and actual
+installations remain unexecuted when signature publisher verification fails.

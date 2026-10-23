@@ -1,6 +1,7 @@
 # Invoked with production POLICY already loaded by the ignored Rust test (prepare/verify),
 # or directly by the workflow (finish). Never upload the raw download/staging directory.
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue' # Windows PowerShell progress rendering slows large downloads.
 Set-StrictMode -Version 2
 $root = $env:ARTCRAFT_MSI_E2E_ROOT
 if ($env:GITHUB_ACTIONS -cne 'true' -or $env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or
@@ -40,6 +41,14 @@ function Get-AppEntries([string]$name) {
             } finally { $base.Dispose() }
         }
     }
+}
+
+function Save-TestReport {
+    # Keep completed verification evidence even if a later download or process is interrupted.
+    $temp = Join-Path $root ([IO.Path]::GetRandomFileName())
+    [IO.File]::WriteAllText($temp, ($report | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
+    if ([IO.File]::Exists($reportPath)) { [IO.File]::Replace($temp, $reportPath, $null) }
+    else { [IO.File]::Move($temp, $reportPath) }
 }
 
 function Assert-Version([string]$name, [string]$version) {
@@ -85,8 +94,10 @@ try {
                 app = $id; version = $version; asset = $asset; checksum = 'not-run'; signature = 'not-run'
                 publisher = $null; identityScope = 'not-run'; productCode = $null; error = $null
                 validationStage = 'published checksums'; metadata = $null
+                signerSubject = $null; signerIssuer = $null; signerThumbprint = $null
             }
             $report.packages += $package
+            Save-TestReport
             try {
                 $url = "https://github.com/storytold/$id/releases/download/v$version"
                 $sums = Read-OfficialChecksums "$url/SHA256SUMS.txt"
@@ -94,7 +105,7 @@ try {
                 [IO.File]::WriteAllText((Join-Path $root "$asset.SHA256SUMS.txt"), $sums)
                 $file = Join-Path $root $asset
                 $package.validationStage = 'MSI download and SHA-256'
-                Invoke-WebRequest "$url/$asset" -OutFile $file -UseBasicParsing -UserAgent 'ArtCraft-Launcher/MSI-E2E'
+                Invoke-WebRequest "$url/$asset" -OutFile $file -UseBasicParsing -TimeoutSec 180 -UserAgent 'ArtCraft-Launcher/MSI-E2E'
                 if ((Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant() -cne $sha) { throw 'Official checksum mismatch' }
                 $package.checksum = $sha
                 $package.validationStage = 'Authenticode publisher'
@@ -102,6 +113,9 @@ try {
                 $package.signature = [string]$sig.Status
                 if ($null -ne $sig.SignerCertificate) {
                     $package.publisher = $sig.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+                    $package.signerSubject = $sig.SignerCertificate.Subject
+                    $package.signerIssuer = $sig.SignerCertificate.Issuer
+                    $package.signerThumbprint = $sig.SignerCertificate.Thumbprint
                 }
                 Assert-OfficialSignature $file
                 $package.validationStage = 'MSI identity and per-machine scope'
@@ -123,9 +137,12 @@ try {
                 # Save the real GitHub API release answer for the Rust backend's pinned update.
                 $package.validationStage = 'official GitHub release metadata'
                 Invoke-WebRequest "https://api.github.com/repos/storytold/$id/releases/tags/v$version" `
-                    -OutFile (Join-Path $root "$id-v$version.json") -UseBasicParsing -UserAgent 'ArtCraft-Launcher/MSI-E2E'
+                    -OutFile (Join-Path $root "$id-v$version.json") -UseBasicParsing -TimeoutSec 30 -UserAgent 'ArtCraft-Launcher/MSI-E2E'
             } catch {
                 $package.error = "Official package preflight failed: $($package.validationStage)"
+            } finally {
+                Save-TestReport
+                Write-Output "::notice title=Official MSI preflight::$asset checksum=$($package.checksum) signature=$($package.signature) publisher=$($package.publisher) stage=$($package.validationStage)"
             }
         }
         if (@($report.packages | Where-Object { $null -ne $_.error }).Count -ne 0) { throw 'Official package preflight failed; no MSI was installed' }
@@ -133,7 +150,7 @@ try {
         # Persist the cleanup allowlist BEFORE installing. Only verified official ProductCodes
         # on a previously empty hosted runner can ever be uninstalled by this test.
         $report.baselineStarted = $true
-        $report | ConvertTo-Json -Depth 12 | Set-Content $reportPath
+        Save-TestReport
         foreach ($spec in @(@('photocraft', 'PhotoCraft', '0.13.0'), @('vectorcraft', 'VectorCraft', '0.15.0'))) {
             $id, $name, $version = $spec
             $file = Join-Path $root "$id-$version-windows-x64.msi"
@@ -143,6 +160,8 @@ try {
             $report.baselineExits += [pscustomobject]@{app=$id; exitCode=$process.ExitCode}
             if ($process.ExitCode -notin @(0,3010)) { throw 'Baseline MSI installation failed' }
             $report.before += Assert-Version $name $version
+            Save-TestReport
+            Write-Output "::notice title=Baseline MSI installed::$name $version exit=$($process.ExitCode)"
         }
         $report.stage = 'InstallAll ready'
         $report.status = 'baseline-installed'
@@ -199,7 +218,7 @@ try {
     $report.status = 'failed'
     $report.error = "Failed at $($report.stage); see package verification and installer results"
 } finally {
-    $report | ConvertTo-Json -Depth 12 | Set-Content $reportPath
+    Save-TestReport
     Copy-Item $reportPath (Join-Path $diagnostics 'report.json') -Force
     if ($phase -eq 'finish') {
         # Fixed fields only: make decisive results visible even if cloud artifact downloads are blocked.
