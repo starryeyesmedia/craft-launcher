@@ -99,6 +99,7 @@
 	ArtCraft Launcher {version}	ArtCraft Launcher {version}
 	Only when I ask	Nur manuell
 	Automatically download and install updates	Updates automatisch herunterladen und installieren
+	Ask for permission once when updating all apps	Beim Aktualisieren aller Apps nur einmal nach Berechtigung fragen
 	Notify me when an installed app has an update	Benachrichtigen, wenn es für eine installierte App ein Update gibt
 	Include pre-releases (betas and release candidates)	Vorabversionen einbeziehen (Betas und Release Candidates)
 	Installing on Linux	Installation unter Linux
@@ -169,6 +170,7 @@
 	Retry update to {version}	Update auf {version} wiederholen
 	The download is still here. It's checked again, then installed.	Der Download ist noch da. Er wird erneut geprüft und dann installiert.
 	Waiting for another app…	Warten auf eine andere App…
+	Waiting for permission…	Warten auf Berechtigung…
 	Waiting for other installs…	Warten auf andere Installationen…
 
 # Package formats offered for download (PackageKind::label)
@@ -182,6 +184,7 @@
 	Tarball (.tar.gz)	Tar-Archiv (.tar.gz)
 
 # Contextual: each app's tagline, keyed by app id
+artcraft	AI image and video creation	KI-Bild- und Videoerstellung
 photocraft	Image editing	Bildbearbeitung
 vectorcraft	Vector illustration	Vektorillustration
 filmcraft	Video editing, color and sound	Videoschnitt, Farbe und Ton
@@ -375,6 +378,8 @@ filter	Installed	Installiert
 	Loading pictures…	Bilder werden geladen…
 	Pictures couldn't be loaded. Reopen this page to try again.	Die Bilder konnten nicht geladen werden. Beim erneuten Öffnen der Seite wird es noch einmal versucht.
 @plural	ArtCraft Launcher · {n} update available|ArtCraft Launcher · {n} updates available	ArtCraft Launcher · {n} Update verfügbar|ArtCraft Launcher · {n} Updates verfügbar
+
+	Download size: {size}	Downloadgröße: {size}
 	Install folder	Installationsordner
 	Default install folder	Standardordner für Installationen
 	System default	Systemstandard
@@ -432,3 +437,6 @@ materialcraft	Preview materials in 2D and on 3D models.	Materialien in 2D und au
 	Migrate Flatpak bundles to ArtCraft OCI (experimental)	Flatpak-Bundles zu ArtCraft OCI migrieren (experimentell)
 	On update, switch first party apps when the matching package is available. Otherwise, keep using bundles.	ArtCraft-Apps beim Aktualisieren umstellen, wenn das passende Paket verfügbar ist. Andernfalls weiterhin Bundles verwenden.
 	The OCI repository is a preview with GPG verification disabled.	Das OCI-Repository ist eine Vorschau mit deaktivierter GPG-Prüfung.
+	Automatic Windows updates	Automatische Windows-Updates
+	Some automatic Windows updates install apps for everyone on this PC and may require administrator permission. Your system may handle permission without showing a prompt.	Einige automatische Windows-Updates installieren Apps für alle Nutzer dieses PCs und benötigen möglicherweise Administratorrechte. Das System kann die Berechtigung auch ohne angezeigte Rückfrage erteilen.
+	Install updates	Updates installieren

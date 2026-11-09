@@ -86,6 +86,7 @@
 	ArtCraft Launcher {version}	ArtCraft Launcher {version}
 	Only when I ask	Pouze na vyžádání
 	Automatically download and install updates	Automaticky stahovat a instalovat aktualizace
+	Ask for permission once when updating all apps	Při aktualizaci všech aplikací požádat o oprávnění pouze jednou
 	Notify me when an installed app has an update	Upozornit, když má nainstalovaná aplikace aktualizaci
 	Include pre-releases (betas and release candidates)	Zahrnout předběžná vydání (beta verze a kandidáty na vydání)
 	Installing on Linux	Instalace v Linuxu
@@ -155,6 +156,7 @@
 	Retry update to {version}	Zkusit aktualizaci na {version} znovu
 	The download is still here. It's checked again, then installed.	Stažený soubor je stále k dispozici. Znovu se ověří a poté nainstaluje.
 	Waiting for another app…	Čekání na jinou aplikaci…
+	Waiting for permission…	Čekání na oprávnění…
 	Waiting for other installs…	Čekání na dokončení ostatních instalací…
 	Installer (.msi)	Instalační program (.msi)
 	Portable (.zip)	Přenosná verze (.zip)
@@ -164,6 +166,7 @@
 	Arch package (.pkg.tar.zst)	Balíček Arch (.pkg.tar.zst)
 	Flatpak bundle	Balíček Flatpak
 	Tarball (.tar.gz)	Archiv tar (.tar.gz)
+artcraft	AI image and video creation	Tvorba obrázků a videí pomocí AI
 photocraft	Image editing	Úpravy obrázků
 vectorcraft	Vector illustration	Vektorová ilustrace
 filmcraft	Video editing, color and sound	Střih videa, barvy a zvuk
@@ -343,6 +346,8 @@ filter	Installed	Nainstalováno
 	ArtCraft on GitHub	ArtCraft na GitHubu
 	Join the ArtCraft Discord	Připojit se na ArtCraft Discord
 @plural	ArtCraft Launcher · {n} update available|ArtCraft Launcher · {n} updates available	ArtCraft Launcher · {n} dostupná aktualizace|ArtCraft Launcher · {n} dostupné aktualizace|ArtCraft Launcher · {n} dostupných aktualizací
+
+	Download size: {size}	Velikost ke stažení: {size}
 	Install folder	Instalační složka
 	Default install folder	Výchozí instalační složka
 	System default	Výchozí nastavení systému
@@ -400,3 +405,6 @@ materialcraft	Preview materials in 2D and on 3D models.	Prohlížejte materiály
 	Migrate Flatpak bundles to ArtCraft OCI (experimental)	Převést balíčky Flatpak na ArtCraft OCI (experimentální)
 	On update, switch first party apps when the matching package is available. Otherwise, keep using bundles.	Při aktualizaci převést aplikace ArtCraft, pokud je dostupný odpovídající balíček. Jinak nadále používat samostatné balíčky.
 	The OCI repository is a preview with GPG verification disabled.	Repozitář OCI je předběžná verze s vypnutým ověřováním GPG.
+	Automatic Windows updates	Automatické aktualizace aplikací ve Windows
+	Some automatic Windows updates install apps for everyone on this PC and may require administrator permission. Your system may handle permission without showing a prompt.	Některé automatické aktualizace aplikací ve Windows instalují aplikace pro všechny uživatele tohoto počítače a mohou vyžadovat oprávnění správce. Systém může oprávnění vyřídit i bez zobrazení výzvy.
+	Install updates	Instalovat aktualizace

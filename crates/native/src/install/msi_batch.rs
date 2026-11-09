@@ -23,19 +23,16 @@ pub(super) fn text(path: &Path) -> Result<&str, String> {
     Ok(text)
 }
 
-/// The `msiexec` arguments for one package, the same ones `msi_command` and the folder and scope
-/// arguments give the single-app route, as one command line.
+/// The `msiexec` arguments for one package, including the same raw folder/scope property string
+/// used by the single-app route, as one command line.
 pub(super) fn line(msi: &Path, destination: Option<&Path>, scope: Option<MsiScope>) -> Result<String, String> {
     let msi = super::msi_path(msi)?;
     let log = super::msi_log(&msi);
     let mut line = format!("/i \"{}\" /passive /norestart /l*v \"{}\"", text(&msi)?, text(&log)?);
-    if let Some(folder) = destination {
+    let extra = super::msi_extra_arguments(destination, scope)?;
+    if !extra.is_empty() {
         line.push(' ');
-        line.push_str(&super::msi_folder_argument(folder)?);
-    }
-    for argument in super::msi_scope_arguments(scope) {
-        line.push(' ');
-        line.push_str(argument);
+        line.push_str(&extra);
     }
     Ok(line)
 }
@@ -113,6 +110,16 @@ pub(super) fn hold(msi: &Path, sha256: &str) -> Result<Held, String> {
         return Err(format!("{} changed after it was checked, so it wasn't installed. Try again.", msi.display()));
     }
     Ok(Held { _file: file })
+}
+
+#[cfg(windows)]
+impl Held {
+    /// A file already opened for reading only (no re-check): the batch session's manifest, held
+    /// the same way its packages are (see [`hold`]).
+    #[cfg(windows)]
+    pub(super) fn keep(file: std::fs::File) -> Held {
+        Held { _file: file }
+    }
 }
 
 /// The base64 form of `script` that `-EncodedCommand` takes: UTF-16 little-endian, so no quoting
